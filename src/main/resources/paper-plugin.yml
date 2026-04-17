@@ -1,0 +1,37 @@
+name: ShadowCore
+version: '${version}'
+main: dev.shadowcore.ShadowCorePlugin
+api-version: '1.21'
+load: STARTUP
+author: ShadowCore
+description: Controller + mounted doll identity orchestration.
+
+# NOTE: ProtocolLib is a soft-dependency. The mod functions without it for
+# presentation smoothing (skin swap, tab-list polishing), but the core
+# dual-ServerPlayer mount/unmount and auth takeover do not require it.
+dependencies:
+  server:
+    ProtocolLib:
+      load: BEFORE
+      required: false
+      join-classpath: true
+
+commands:
+  lprofile:
+    description: Manage local profiles.
+    usage: /lprofile <create|switch|list|rename|delete|status|discard|logout|main|setlimit|admindelete> ...
+    aliases: [localprofile, lp]
+  shadow:
+    description: Mount another identity as a shadow session.
+    usage: /shadow <target|logout|discard|status> ...
+
+permissions:
+  shadowcore.use:
+    description: Permission to use base local profile commands.
+    default: true
+  shadowcore.admin:
+    description: Permission to use shadow and admin commands.
+    default: op
+  shadowcore.profile.bypass-limit:
+    description: Permission to bypass the local profile creation limit.
+    default: false

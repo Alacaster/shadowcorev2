@@ -1,0 +1,27 @@
+# ShadowCore 3.0 — orchestration-only configuration.
+# The database holds per-controller settings; this file holds global defaults.
+
+# Default maximum local profiles per controller. Individual controllers can be
+# raised by operators via /lprofile setlimit <player> <limit>.
+default-max-profiles: 2
+
+# Whether the plugin should attempt to reconstruct shadow reservations from the
+# database on enable. Turning off is a safety valve if your DB is corrupted.
+rebuild-shadow-reservations-on-enable: true
+
+# Default per-controller policy for forced-shadow-end (§13):
+#   true  = throw away the mounted shadow changes on conflict.
+#   false = save them to the shadow target's .dat before entering shell.
+shadow-conflict-auto-discard-default: true
+
+# Default per-controller policy for baseline restore position after shell:
+#   true  = use the baseline's saved .dat position.
+#   false = preserve the shell's current location.
+shadow-conflict-reset-position-default: true
+
+# TTL for the Mojang sessionserver skin cache (minutes). When a /shadow
+# target resolves to a real Mojang account, we fetch their skin texture +
+# signature once and cache it here so the mounted doll renders as the
+# target. Set to 0 to disable caching (not recommended — every shadow will
+# hit sessionserver).
+skin-cache-minutes: 60
