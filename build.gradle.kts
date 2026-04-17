@@ -1,4 +1,5 @@
 import io.papermc.paperweight.userdev.ReobfArtifactConfiguration
+import org.gradle.language.base.plugins.LifecycleBasePlugin
 
 plugins {
     java
@@ -58,4 +59,33 @@ tasks.jar {
 
 tasks.runServer {
     minecraftVersion("1.21.11")
+}
+
+tasks.register("runPaper") {
+    group = "paper"
+    description = "Alias for runServer to make Paper dev startup explicit."
+    dependsOn(tasks.runServer)
+}
+
+tasks.register("verifyDependencies") {
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    description = "Resolves key classpaths to verify dependency repositories and coordinates."
+
+    doLast {
+        val configurationsToVerify = listOf(
+            configurations.compileClasspath.get(),
+            configurations.runtimeClasspath.get(),
+            configurations.testCompileClasspath.get(),
+            configurations.testRuntimeClasspath.get()
+        ).filter { it.isCanBeResolved }
+
+        configurationsToVerify.forEach { configuration ->
+            logger.lifecycle("Verifying dependency graph for configuration: ${configuration.name}")
+            configuration.resolve()
+        }
+    }
+}
+
+tasks.check {
+    dependsOn("verifyDependencies")
 }
