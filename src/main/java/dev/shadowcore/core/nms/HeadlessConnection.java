@@ -25,6 +25,7 @@ import net.minecraft.network.protocol.PacketFlow;
  * When the mount swaps, the old one is discarded and a new one is built.</p>
  */
 public final class HeadlessConnection extends Connection {
+    private static final java.lang.reflect.Field CHANNEL_FIELD = resolveChannelField();
     /** Null until {@link #forwardTo} is called. */
     private Connection realConnection;
 
@@ -53,6 +54,7 @@ public final class HeadlessConnection extends Connection {
 
     public void forwardTo(final Connection real) {
         this.realConnection = real;
+        mirrorUnderlyingChannel(real);
     }
 
     public void setFilter(final BiPredicate<Packet<?>, HeadlessConnection> filter) {
@@ -80,12 +82,6 @@ public final class HeadlessConnection extends Connection {
         if (realConnection == null) return;        // mount not yet wired
         if (!filter.test(packet, this)) return;    // presentation policy drop
         realConnection.send(packet, listener, flush);
-    }
-
-    @Override
-    public void flush() {
-        if (realConnection == null) return;
-        realConnection.flush();
     }
 
     @Override
@@ -119,5 +115,25 @@ public final class HeadlessConnection extends Connection {
     @Override
     public void handleDisconnection() {
         // Same rationale.
+    }
+
+    private static java.lang.reflect.Field resolveChannelField() {
+        try {
+            final java.lang.reflect.Field f = Connection.class.getDeclaredField("channel");
+            f.setAccessible(true);
+            return f;
+        } catch (final ReflectiveOperationException ex) {
+            return null;
+        }
+    }
+
+    private void mirrorUnderlyingChannel(final Connection real) {
+        if (CHANNEL_FIELD == null || real == null) return;
+        try {
+            final Object delegateChannel = CHANNEL_FIELD.get(real);
+            CHANNEL_FIELD.set(this, delegateChannel);
+        } catch (final ReflectiveOperationException ignored) {
+            // Best-effort only; send/flushChannel delegation still works for most paths.
+        }
     }
 }
