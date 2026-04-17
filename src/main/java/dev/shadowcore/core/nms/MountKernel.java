@@ -14,10 +14,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.CommonListenerCookie;
 import net.minecraft.server.network.ServerGamePacketListenerImpl;
-import net.minecraft.server.players.GameProfileCache;
 import net.minecraft.server.players.PlayerList;
-import net.minecraft.world.entity.HumanoidArm;
-import net.minecraft.world.entity.player.ChatVisiblity;
 import org.bukkit.GameMode;
 
 /**
@@ -67,7 +64,6 @@ public final class MountKernel {
     private final Logger log;
     private final MinecraftServer server;
     private final PlayerList playerList;
-    private final GameProfileCache profileCache;
     private final DualPlayerRegistry registry;
     private final PacketRouter router;
     private final MountBackup backup;
@@ -80,7 +76,6 @@ public final class MountKernel {
         this.log = Objects.requireNonNull(log);
         this.server = Objects.requireNonNull(server);
         this.playerList = server.getPlayerList();
-        this.profileCache = server.getProfileCache();
         this.registry = Objects.requireNonNull(registry);
         this.router = Objects.requireNonNull(router);
         this.backup = Objects.requireNonNull(backup);
@@ -127,7 +122,7 @@ public final class MountKernel {
     public void persist(final DualPlayerSession session) {
         final ServerPlayer mounted = session.mounted();
         if (mounted == null || mounted == session.controller()) return;
-        playerList.save(mounted);
+        savePlayerData(mounted);
     }
 
     public void unmount(final DualPlayerSession session, final MountDisposition disposition) {
@@ -166,7 +161,7 @@ public final class MountKernel {
         }
         // Self-mount — vanilla reload on the controller ServerPlayer.
         try {
-            playerList.load(mounted);
+            loadPlayerData(mounted);
             mounted.getBukkitEntity().updateInventory();
             return true;
         } catch (final RuntimeException ex) {
@@ -275,7 +270,7 @@ public final class MountKernel {
             skinResolver.cached(uuid).ifPresent(p ->
                 dev.shadowcore.core.auth.SkinResolver.applyProperty(profile, p));
         }
-        profileCache.add(profile);
+        addProfileToServerCache(profile);
 
         final ServerLevel overworld = server.overworld();
         final net.minecraft.server.level.ClientInformation clientInfo = copyControllerClientInfo(session);
@@ -295,7 +290,7 @@ public final class MountKernel {
         // (or dimension-specific equivalents on 1.21) and invokes ServerPlayer#load.
         // If no .dat exists, vanilla leaves the doll in its construction-default state.
         try {
-            playerList.load(doll);
+            loadPlayerData(doll);
         } catch (final RuntimeException ex) {
             log.warning("playerList.load for " + uuid + " failed (fresh identity likely): " + ex.getMessage());
         }
@@ -385,14 +380,86 @@ public final class MountKernel {
     }
 
     private net.minecraft.server.level.ClientInformation copyControllerClientInfo(final DualPlayerSession session) {
+        return session.controller().clientInformation();
+    }
+
+    private void addProfileToServerCache(final GameProfile profile) {
         try {
-            return session.controller().clientInformation();
-        } catch (final RuntimeException ex) {
-            return new net.minecraft.server.level.ClientInformation(
-                "en_us", 8, ChatVisiblity.FULL, true, 0, HumanoidArm.RIGHT,
-                false, true, net.minecraft.core.particles.ParticleStatus.ALL
-            );
+            final var getProfileCache = server.getClass().getMethod("getProfileCache");
+            final Object cache = getProfileCache.invoke(server);
+            if (cache == null) return;
+            final var add = cache.getClass().getMethod("add", GameProfile.class);
+            add.invoke(cache, profile);
+        } catch (final ReflectiveOperationException ignored) {
+            // Mapping drift: cache insertion is optional for runtime correctness.
         }
+    }
+
+    private void savePlayerData(final ServerPlayer player) {
+        if (tryInvokePlayerListPlayerMethod("save", player)) return;
+        if (tryInvokePlayerDataStorageMethod("save", player)) return;
+        throw new RuntimeException("Unable to invoke save path for ServerPlayer");
+    }
+
+    private void loadPlayerData(final ServerPlayer player) {
+        if (tryInvokePlayerListPlayerMethod("load", player)) return;
+        if (tryInvokePlayerDataStorageMethod("load", player)) return;
+        throw new RuntimeException("Unable to invoke load path for ServerPlayer");
+    }
+
+    private boolean tryInvokePlayerListPlayerMethod(final String preferredName, final ServerPlayer player) {
+        try {
+            for (Class<?> c = playerList.getClass(); c != null; c = c.getSuperclass()) {
+                for (final var method : c.getDeclaredMethods()) {
+                    if (method.getParameterCount() != 1 || !ServerPlayer.class.isAssignableFrom(method.getParameterTypes()[0])) continue;
+                    if (!method.getName().equals(preferredName)) continue;
+                    method.setAccessible(true);
+                    method.invoke(playerList, player);
+                    return true;
+                }
+            }
+        } catch (final ReflectiveOperationException ex) {
+            return false;
+        }
+        return false;
+    }
+
+    private boolean tryInvokePlayerDataStorageMethod(final String preferredName, final ServerPlayer player) {
+        try {
+            final Object storage = resolvePlayerDataStorage();
+            if (storage == null) return false;
+            for (Class<?> c = storage.getClass(); c != null; c = c.getSuperclass()) {
+                for (final var method : c.getDeclaredMethods()) {
+                    if (method.getParameterCount() != 1 || !ServerPlayer.class.isAssignableFrom(method.getParameterTypes()[0])) continue;
+                    if (!method.getName().equals(preferredName)) continue;
+                    method.setAccessible(true);
+                    method.invoke(storage, player);
+                    return true;
+                }
+            }
+        } catch (final ReflectiveOperationException ex) {
+            return false;
+        }
+        return false;
+    }
+
+    private Object resolvePlayerDataStorage() throws ReflectiveOperationException {
+        final Class<?> serverClass = server.getClass();
+        final java.util.Set<String> names = java.util.Set.of(
+            "getplayeriostorage", "getplayerio", "playeriostorage", "playerio",
+            "getplayerdatastorage", "getplayerdata", "playerdatastorage", "playerdata"
+        );
+        for (Class<?> c = serverClass; c != null; c = c.getSuperclass()) {
+            for (final var method : c.getDeclaredMethods()) {
+                if (method.getParameterCount() != 0) continue;
+                final String name = method.getName().toLowerCase(java.util.Locale.ROOT);
+                if (!names.contains(name)) continue;
+                method.setAccessible(true);
+                final Object value = method.invoke(server);
+                if (value != null) return value;
+            }
+        }
+        return null;
     }
 
     private PacketRouter.PacketRoutingPolicy buildPolicy(final ServerGamePacketListenerImpl mountedListener,

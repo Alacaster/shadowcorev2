@@ -6,15 +6,7 @@ load: STARTUP
 author: ShadowCore
 description: Controller + mounted doll identity orchestration.
 
-# NOTE: ProtocolLib is a soft-dependency. The mod functions without it for
-# presentation smoothing (skin swap, tab-list polishing), but the core
-# dual-ServerPlayer mount/unmount and auth takeover do not require it.
-dependencies:
-  server:
-    ProtocolLib:
-      load: BEFORE
-      required: false
-      join-classpath: true
+softdepend: [ProtocolLib]
 
 commands:
   lprofile:

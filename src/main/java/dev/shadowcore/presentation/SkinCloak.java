@@ -8,8 +8,6 @@ import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.wrappers.WrappedGameProfile;
-import com.comphenix.protocol.wrappers.WrappedSignedProperty;
-import java.util.Collection;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -103,9 +101,10 @@ public final class SkinCloak {
                 // Replace; API varies across ProtocolLib versions, so we try
                 // both the setter-based and withProfile-based paths.
                 try {
-                    entry.setProfile(scrubbedProfile);
-                    changed = true;
-                } catch (final RuntimeException setEx) {
+                    if (trySetProfile(entry, scrubbedProfile)) {
+                        changed = true;
+                    }
+                } catch (final ReflectiveOperationException setEx) {
                     // Older API: we can only skip here. The REMOVE packet
                     // broadcast by PresentationService is the fallback.
                 }
@@ -123,5 +122,12 @@ public final class SkinCloak {
             final int index) {
         try { return (java.util.List<T>) modifier.read(index); }
         catch (final RuntimeException ex) { return null; }
+    }
+
+    private static boolean trySetProfile(final Object entry, final WrappedGameProfile profile)
+            throws ReflectiveOperationException {
+        final var setProfile = entry.getClass().getMethod("setProfile", WrappedGameProfile.class);
+        setProfile.invoke(entry, profile);
+        return true;
     }
 }

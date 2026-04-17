@@ -9,7 +9,6 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.logging.Logger;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.players.GameProfileCache;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -70,15 +69,26 @@ public final class AuthGateway implements Listener {
      * Called once at plugin enable.
      */
     public void bootstrap() {
-        final GameProfileCache cache = server.getProfileCache();
         int loaded = 0;
         for (final ProfileRecord p : db.listAllProfiles()) {
             final String base = db.getAccountName(p.ownerUuid()).orElse("player");
             final String displayName = Naming.reconstructDisplayName(base, p.suffix());
-            cache.add(new GameProfile(p.profileUuid(), displayName));
+            addProfileToServerCache(new GameProfile(p.profileUuid(), displayName));
             loaded++;
         }
         if (loaded > 0) log.info("AuthGateway: pre-populated " + loaded + " local profile names into the GameProfileCache.");
+    }
+
+    private void addProfileToServerCache(final GameProfile profile) {
+        try {
+            final var getProfileCache = server.getClass().getMethod("getProfileCache");
+            final Object cache = getProfileCache.invoke(server);
+            if (cache == null) return;
+            final var add = cache.getClass().getMethod("add", GameProfile.class);
+            add.invoke(cache, profile);
+        } catch (final ReflectiveOperationException ignored) {
+            // Mapping drift between minor versions: cache prepopulation is an optimization only.
+        }
     }
 
     /**
