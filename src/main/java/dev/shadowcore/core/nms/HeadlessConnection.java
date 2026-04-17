@@ -1,8 +1,8 @@
 package dev.shadowcore.core.nms;
 
+import io.netty.channel.ChannelFutureListener;
 import java.util.function.BiPredicate;
 import net.minecraft.network.Connection;
-import net.minecraft.network.PacketSendListener;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
 
@@ -67,16 +67,16 @@ public final class HeadlessConnection extends Connection {
 
     @Override
     public void send(final Packet<?> packet) {
-        send(packet, (PacketSendListener) null);
+        send(packet, (ChannelFutureListener) null, true);
     }
 
     @Override
-    public void send(final Packet<?> packet, final PacketSendListener listener) {
+    public void send(final Packet<?> packet, final ChannelFutureListener listener) {
         send(packet, listener, true);
     }
 
     @Override
-    public void send(final Packet<?> packet, final PacketSendListener listener, final boolean flush) {
+    public void send(final Packet<?> packet, final ChannelFutureListener listener, final boolean flush) {
         if (realConnection == null) return;        // mount not yet wired
         if (!filter.test(packet, this)) return;    // presentation policy drop
         realConnection.send(packet, listener, flush);
@@ -93,7 +93,6 @@ public final class HeadlessConnection extends Connection {
         return realConnection != null && realConnection.isConnected();
     }
 
-    @Override
     public boolean isConnecting() {
         return false;
     }

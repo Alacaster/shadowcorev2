@@ -67,7 +67,7 @@ public final class PlayerListAccess {
             }
             if (byNameObj instanceof Map<?, ?>) {
                 final Map<String, ServerPlayer> byName = (Map<String, ServerPlayer>) byNameObj;
-                byName.put(mounted.getGameProfile().getName(), mounted);
+                byName.put(mounted.getGameProfile().name(), mounted);
             }
             return true;
         } catch (final ReflectiveOperationException ex) {
@@ -91,7 +91,7 @@ public final class PlayerListAccess {
             final Object byNameObj = BY_NAME_FIELD.get(list);
             if (playersObj instanceof List<?>) ((List<ServerPlayer>) playersObj).remove(mounted);
             if (byUuidObj instanceof Map<?, ?>) ((Map<UUID, ServerPlayer>) byUuidObj).remove(mounted.getUUID());
-            if (byNameObj instanceof Map<?, ?>) ((Map<String, ServerPlayer>) byNameObj).remove(mounted.getGameProfile().getName());
+            if (byNameObj instanceof Map<?, ?>) ((Map<String, ServerPlayer>) byNameObj).remove(mounted.getGameProfile().name());
             return true;
         } catch (final ReflectiveOperationException ex) {
             LOG.severe("PlayerListAccess.unregisterMounted failed: " + ex.getMessage());

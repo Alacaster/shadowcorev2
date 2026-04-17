@@ -189,7 +189,7 @@ public final class Manager {
 
         final ProfileRecord pr = target.get();
         final ProfileIdentity newBaseline = ProfileIdentity.local(e.actor(), pr.profileUuid(), pr.suffix());
-        final String base = db.getAccountName(e.actor()).orElse(session.controller().getGameProfile().getName());
+        final String base = db.getAccountName(e.actor()).orElse(session.controller().getGameProfile().name());
         final String display = Naming.reconstructDisplayName(base, pr.suffix());
         final MountedIdentity next = MountedIdentity.ofBaseline(newBaseline, display);
 
@@ -333,7 +333,7 @@ public final class Manager {
         final DualPlayerSession session = registry.byController(e.actor()).orElse(null);
         if (session == null) { e.response().reply("<red>Not connected.</red>"); return; }
         final ProfileIdentity mainId = ProfileIdentity.main(e.actor());
-        final String baseName = db.getAccountName(e.actor()).orElse(session.controller().getGameProfile().getName());
+        final String baseName = db.getAccountName(e.actor()).orElse(session.controller().getGameProfile().name());
         final MountedIdentity mainMount = MountedIdentity.ofBaseline(mainId, baseName);
         // If currently shadowing, end shadow first (COMMIT by default).
         final SessionRecord sess = db.loadSession(e.actor()).orElse(null);

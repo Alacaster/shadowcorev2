@@ -108,12 +108,12 @@ public final class SkinResolver {
     public static GameProfile applyProperty(final GameProfile profile, final Property property) {
         if (property == null) return profile;
         try {
-            profile.getProperties().put("textures", property);
+            profile.properties().put("textures", property);
         } catch (final RuntimeException ex) {
             // Older authlib may throw if properties is immutable — fall back
             // to a copy.
-            final GameProfile copy = new GameProfile(profile.getId(), profile.getName());
-            try { copy.getProperties().put("textures", property); }
+            final GameProfile copy = new GameProfile(profile.id(), profile.name());
+            try { copy.properties().put("textures", property); }
             catch (final RuntimeException ignored) {}
             return copy;
         }
