@@ -32,7 +32,7 @@ dependencies {
     // connection and the mounted ServerPlayer happens at the NMS layer, not
     // through ProtocolLib, because we need reliable ordering and construction
     // of CLIENTBOUND packets in the same form vanilla produces them.
-    compileOnly("com.comphenix.protocol:ProtocolLib:5.4.0")
+    compileOnly("net.dmulloy2:ProtocolLib:5.4.0")
 }
 
 // Reobfuscation disabled — Paper 26.1+ does not remap plugins to Spigot mappings.
