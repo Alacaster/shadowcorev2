@@ -4,13 +4,12 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
-import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.logging.Logger;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
 
 /**
  * Pre-mount .dat backups used to implement {@link
@@ -41,15 +40,15 @@ import net.minecraft.server.MinecraftServer;
 public final class MountBackup {
     private final Logger log;
     private final MinecraftServer server;
-    private final File playerDataDir;
     private final File backupDir;
     /** UUIDs whose pre-mount state was "no .dat existed" — restore means delete. */
     private final Set<UUID> wasAbsent = ConcurrentHashMap.newKeySet();
+    private volatile File playerDataDir;
+    private volatile boolean warnedPlayerDataUnavailable;
 
     public MountBackup(final Logger log, final MinecraftServer server, final File pluginDataDir) {
         this.log = log;
         this.server = server;
-        this.playerDataDir = new File(server.overworld().getWorld().getWorldFolder(), "playerdata");
         this.backupDir = new File(pluginDataDir, "mount-backups");
         if (!backupDir.exists() && !backupDir.mkdirs()) {
             log.warning("Could not create mount backup directory " + backupDir);
@@ -58,7 +57,8 @@ public final class MountBackup {
 
     /** Capture the current .dat for a UUID about to be mounted. */
     public void capture(final UUID uuid) {
-        final File live = datFile(uuid);
+        final File live = datFileOrNull(uuid);
+        if (live == null) return;
         final File bak = backupFile(uuid);
         try {
             if (!live.exists()) {
@@ -77,7 +77,8 @@ public final class MountBackup {
 
     /** Restore the backup over the live .dat — used on DISCARD unmount. */
     public void restore(final UUID uuid) {
-        final File live = datFile(uuid);
+        final File live = datFileOrNull(uuid);
+        if (live == null) return;
         final File bak = backupFile(uuid);
         try {
             if (wasAbsent.remove(uuid)) {
@@ -108,11 +109,30 @@ public final class MountBackup {
         }
     }
 
-    private File datFile(final UUID uuid) {
-        return new File(playerDataDir, uuid + ".dat");
+    private File datFileOrNull(final UUID uuid) {
+        final File dir = resolvePlayerDataDir();
+        if (dir == null) return null;
+        return new File(dir, uuid + ".dat");
     }
 
     private File backupFile(final UUID uuid) {
         return new File(backupDir, uuid + ".dat.bak");
+    }
+
+    private File resolvePlayerDataDir() {
+        final File cached = this.playerDataDir;
+        if (cached != null) return cached;
+        final ServerLevel overworld = server.overworld();
+        if (overworld == null || overworld.getWorld() == null) {
+            if (!warnedPlayerDataUnavailable) {
+                warnedPlayerDataUnavailable = true;
+                log.warning("MountBackup: overworld is not ready yet; playerdata backup is temporarily unavailable.");
+            }
+            return null;
+        }
+        final File resolved = new File(overworld.getWorld().getWorldFolder(), "playerdata");
+        this.playerDataDir = resolved;
+        warnedPlayerDataUnavailable = false;
+        return resolved;
     }
 }
