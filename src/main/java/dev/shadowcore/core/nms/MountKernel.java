@@ -396,14 +396,18 @@ public final class MountKernel {
     }
 
     private void savePlayerData(final ServerPlayer player) {
-        invokePlayerListPlayerMethod("save", player);
+        if (tryInvokePlayerListPlayerMethod("save", player)) return;
+        if (tryInvokePlayerDataStorageMethod("save", player)) return;
+        throw new RuntimeException("Unable to invoke save path for ServerPlayer");
     }
 
     private void loadPlayerData(final ServerPlayer player) {
-        invokePlayerListPlayerMethod("load", player);
+        if (tryInvokePlayerListPlayerMethod("load", player)) return;
+        if (tryInvokePlayerDataStorageMethod("load", player)) return;
+        throw new RuntimeException("Unable to invoke load path for ServerPlayer");
     }
 
-    private void invokePlayerListPlayerMethod(final String preferredName, final ServerPlayer player) {
+    private boolean tryInvokePlayerListPlayerMethod(final String preferredName, final ServerPlayer player) {
         try {
             for (Class<?> c = playerList.getClass(); c != null; c = c.getSuperclass()) {
                 for (final var method : c.getDeclaredMethods()) {
@@ -411,13 +415,51 @@ public final class MountKernel {
                     if (!method.getName().equals(preferredName)) continue;
                     method.setAccessible(true);
                     method.invoke(playerList, player);
-                    return;
+                    return true;
                 }
             }
-            throw new NoSuchMethodException(preferredName + "(ServerPlayer)");
         } catch (final ReflectiveOperationException ex) {
-            throw new RuntimeException("Unable to invoke PlayerList#" + preferredName + "(ServerPlayer)", ex);
+            return false;
         }
+        return false;
+    }
+
+    private boolean tryInvokePlayerDataStorageMethod(final String preferredName, final ServerPlayer player) {
+        try {
+            final Object storage = resolvePlayerDataStorage();
+            if (storage == null) return false;
+            for (Class<?> c = storage.getClass(); c != null; c = c.getSuperclass()) {
+                for (final var method : c.getDeclaredMethods()) {
+                    if (method.getParameterCount() != 1 || !ServerPlayer.class.isAssignableFrom(method.getParameterTypes()[0])) continue;
+                    if (!method.getName().equals(preferredName)) continue;
+                    method.setAccessible(true);
+                    method.invoke(storage, player);
+                    return true;
+                }
+            }
+        } catch (final ReflectiveOperationException ex) {
+            return false;
+        }
+        return false;
+    }
+
+    private Object resolvePlayerDataStorage() throws ReflectiveOperationException {
+        final Class<?> serverClass = server.getClass();
+        final java.util.Set<String> names = java.util.Set.of(
+            "getplayeriostorage", "getplayerio", "playeriostorage", "playerio",
+            "getplayerdatastorage", "getplayerdata", "playerdatastorage", "playerdata"
+        );
+        for (Class<?> c = serverClass; c != null; c = c.getSuperclass()) {
+            for (final var method : c.getDeclaredMethods()) {
+                if (method.getParameterCount() != 0) continue;
+                final String name = method.getName().toLowerCase(java.util.Locale.ROOT);
+                if (!names.contains(name)) continue;
+                method.setAccessible(true);
+                final Object value = method.invoke(server);
+                if (value != null) return value;
+            }
+        }
+        return null;
     }
 
     private PacketRouter.PacketRoutingPolicy buildPolicy(final ServerGamePacketListenerImpl mountedListener,
