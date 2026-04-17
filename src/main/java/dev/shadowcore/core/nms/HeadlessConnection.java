@@ -82,6 +82,18 @@ public final class HeadlessConnection extends Connection {
         realConnection.send(packet, listener, flush);
     }
 
+    @Override
+    public void flush() {
+        if (realConnection == null) return;
+        realConnection.flush();
+    }
+
+    @Override
+    public void flushChannel() {
+        if (realConnection == null) return;
+        realConnection.flushChannel();
+    }
+
     // ──────────────────────────────────────────────────────────────────
     //  Disable lifecycle methods that vanilla might call on the fake conn.
     //  We do NOT want disconnecting the mounted-side to actually close the
