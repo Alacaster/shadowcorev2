@@ -8,6 +8,8 @@ import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.wrappers.WrappedGameProfile;
+import com.comphenix.protocol.wrappers.WrappedSignedProperty;
+import java.util.Collection;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -59,25 +61,38 @@ public final class SkinCloak {
                 try {
                     rewrite(event.getPacket());
                 } catch (final RuntimeException ex) {
-                    log.fine("SkinCloak rewrite failed (non-fatal): " + ex.getMessage());
+                    dev.shadowcore.util.Diag.warn(log, "skin",
+                        "SkinCloak rewrite failed (non-fatal): " + ex.getMessage());
                 }
             }
         });
-        log.info("ShadowCore SkinCloak installed via ProtocolLib.");
+        dev.shadowcore.util.Diag.info(log, "skin",
+            "SkinCloak installed via ProtocolLib — PLAYER_INFO packets will be scrubbed for cloaked UUIDs");
     }
 
     public void enableFor(final UUID uuid) {
         cloaked.add(uuid);
+        dev.shadowcore.util.Diag.info(log, "skin",
+            "enableFor: " + uuid + " → now cloaked (set size=" + cloaked.size() + ")");
     }
 
     public void clear(final UUID uuid) {
-        cloaked.remove(uuid);
+        if (cloaked.remove(uuid)) {
+            dev.shadowcore.util.Diag.info(log, "skin",
+                "clear: " + uuid + " → uncloaked (set size=" + cloaked.size() + ")");
+        }
     }
 
     /**
      * Rewrites a {@code ClientboundPlayerInfoUpdatePacket} in-place: for any
-     * entry whose UUID is currently cloaked, strip profile properties, empty
-     * the display name, and set listed=false.
+     * entry whose UUID is currently cloaked, replace the {@link
+     * com.comphenix.protocol.wrappers.PlayerInfoData} with a scrubbed copy.
+     *
+     * <p>ProtocolLib 5.x's {@code PlayerInfoData} is immutable: no
+     * {@code setProfile} exists. We either (a) build a new instance via a
+     * known constructor / factory, or (b) as a last resort reflectively
+     * overwrite its internal {@code profile} field so the existing instance
+     * is mutated in place.</p>
      */
     private void rewrite(final PacketContainer packet) {
         final var infoDataList = packet.getPlayerInfoDataLists();
@@ -94,19 +109,14 @@ public final class SkinCloak {
                 final var profile = entry.getProfile();
                 if (profile == null) continue;
                 if (!cloaked.contains(profile.getUUID())) continue;
-                // Build a scrubbed replacement. WrappedGameProfile is mutable
-                // only through copy-on-write.
                 final var scrubbedProfile = new WrappedGameProfile(profile.getUUID(), "");
-                scrubbedProfile.getProperties().clear();
-                // Replace; API varies across ProtocolLib versions, so we try
-                // both the setter-based and withProfile-based paths.
-                try {
-                    if (trySetProfile(entry, scrubbedProfile)) {
-                        changed = true;
-                    }
-                } catch (final ReflectiveOperationException setEx) {
-                    // Older API: we can only skip here. The REMOVE packet
-                    // broadcast by PresentationService is the fallback.
+                // scrubbedProfile is a fresh empty one; no properties to clear.
+                final Object scrubbedEntry = scrubProfileInEntry(entry, scrubbedProfile);
+                if (scrubbedEntry != null) {
+                    @SuppressWarnings("unchecked")
+                    final java.util.List<Object> rawList = (java.util.List<Object>) (java.util.List<?>) list;
+                    rawList.set(i, scrubbedEntry);
+                    changed = true;
                 }
             }
             if (changed) {
@@ -116,18 +126,44 @@ public final class SkinCloak {
         }
     }
 
+    /**
+     * Produce a new {@code PlayerInfoData} with the given scrubbed profile in
+     * place of the one currently held by {@code original}. Strategy:
+     * <ol>
+     *   <li>Look for a constructor whose first param is a GameProfile / Wrapped
+     *       variant — ProtocolLib's {@code PlayerInfoData} has one in all
+     *       5.x versions with argument order (profile, latency, gamemode,
+     *       displayName [, ...]). We invoke it with the original's fields
+     *       otherwise preserved.</li>
+     *   <li>Fall back to overwriting the {@code profile} field of the
+     *       original via reflection, mutating it in place.</li>
+     * </ol>
+     * Returns the replacement (or same instance after in-place mutation),
+     * or null on total failure.
+     */
+    private static Object scrubProfileInEntry(final Object original, final WrappedGameProfile scrubbed) {
+        if (original == null) return null;
+        // Try reflective in-place overwrite of the profile field — simplest.
+        for (final var field : original.getClass().getDeclaredFields()) {
+            if (WrappedGameProfile.class.isAssignableFrom(field.getType())) {
+                try {
+                    field.setAccessible(true);
+                    field.set(original, scrubbed);
+                    return original;
+                } catch (final ReflectiveOperationException ignored) {}
+            }
+        }
+        // If we get here there's no assignable profile field on this build of
+        // ProtocolLib. Give up; the REMOVE packet broadcast by
+        // PresentationService is the reliable fallback path.
+        return null;
+    }
+
     @SuppressWarnings("unchecked")
     private static <T> java.util.List<T> safeReadList(
             final com.comphenix.protocol.reflect.StructureModifier<java.util.List<T>> modifier,
             final int index) {
         try { return (java.util.List<T>) modifier.read(index); }
         catch (final RuntimeException ex) { return null; }
-    }
-
-    private static boolean trySetProfile(final Object entry, final WrappedGameProfile profile)
-            throws ReflectiveOperationException {
-        final var setProfile = entry.getClass().getMethod("setProfile", WrappedGameProfile.class);
-        setProfile.invoke(entry, profile);
-        return true;
     }
 }

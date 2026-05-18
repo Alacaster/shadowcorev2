@@ -107,17 +107,25 @@ public final class SkinResolver {
      */
     public static GameProfile applyProperty(final GameProfile profile, final Property property) {
         if (property == null) return profile;
-        try {
-            profile.properties().put("textures", property);
-        } catch (final RuntimeException ex) {
-            // Older authlib may throw if properties is immutable — fall back
-            // to a copy.
-            final GameProfile copy = new GameProfile(profile.id(), profile.name());
-            try { copy.properties().put("textures", property); }
-            catch (final RuntimeException ignored) {}
-            return copy;
+        final var props = dev.shadowcore.core.nms.NmsCompat.profileProperties(profile);
+        if (props != null) {
+            try {
+                props.put("textures", property);
+                return profile;
+            } catch (final RuntimeException ignored) {
+                // fall through to copy
+            }
         }
-        return profile;
+        // Copy fallback.
+        final GameProfile copy = new GameProfile(
+            dev.shadowcore.core.nms.NmsCompat.profileId(profile),
+            dev.shadowcore.core.nms.NmsCompat.profileName(profile));
+        final var copyProps = dev.shadowcore.core.nms.NmsCompat.profileProperties(copy);
+        if (copyProps != null) {
+            try { copyProps.put("textures", property); }
+            catch (final RuntimeException ignored) {}
+        }
+        return copy;
     }
 
     private record CachedSkin(Property property, long timestamp) {}

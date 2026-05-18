@@ -1,204 +1,125 @@
 package dev.shadowcore.presentation;
 
-import com.mojang.authlib.GameProfile;
-import dev.shadowcore.core.nms.DualPlayerRegistry;
-import dev.shadowcore.core.nms.DualPlayerSession;
+import dev.shadowcore.core.swap.Session;
+import dev.shadowcore.core.swap.SessionRegistry;
 import dev.shadowcore.model.MountedIdentity;
-import java.util.EnumSet;
 import java.util.List;
 import java.util.UUID;
 import java.util.logging.Logger;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
-import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
 import net.minecraft.server.level.ServerPlayer;
 import org.bukkit.Bukkit;
 
 /**
- * Presentation policy — spec §14, sync spec §3.2, and PHANTOM mode.
+ * Presentation policy for 4.0.
  *
- * <h2>Policy matrix per mounted kind</h2>
- * <table>
- *   <caption>Observer views</caption>
- *   <tr><th>Kind</th><th>Controller's own tab</th><th>Others' tab</th><th>World body</th></tr>
- *   <tr><td>MAIN</td>    <td>Self (normal)</td>    <td>Self (normal)</td>    <td>Controller, visible</td></tr>
- *   <tr><td>LOCAL</td>   <td>Mounted profile</td>  <td>Mounted profile</td>  <td>Mounted, visible</td></tr>
- *   <tr><td>SHADOW</td>  <td>Baseline (hidden target)</td>
- *                        <td>Baseline only — target hidden from tab</td>
- *                        <td>Mounted target, visible</td></tr>
- *   <tr><td>PHANTOM</td> <td>Baseline (but self is removed from PlayerInfo too)</td>
- *                        <td>REMOVED from tab entirely</td>
- *                        <td>Baseline with INVISIBILITY effect, no name, default skin</td></tr>
- * </table>
+ * <p>Scope has shrunk dramatically from the 3.0 version. The 3.0 service
+ * had to maintain consistency between a controller ServerPlayer and a
+ * separate "doll" ServerPlayer on the same channel — hiding the
+ * controller from tab, filtering dual-body visibility, and fighting
+ * leaks from the shared Netty pipe via a ProtocolLib-backed SkinCloak.
+ * The 4.0 service only has one ServerPlayer per active identity driving
+ * the socket, so there is nothing to filter between.</p>
  *
- * <h2>How we enforce PHANTOM presentation</h2>
- * <ol>
- *   <li><b>Tab removal</b> — broadcast a PlayerInfo REMOVE for the baseline
- *       UUID to every observer. Modern clients handle self-removal gracefully
- *       (they keep first-person rendering).</li>
- *   <li><b>World invisibility</b> — handled by {@link
- *       dev.shadowcore.core.nms.MountKernel} adding the vanilla
- *       INVISIBILITY mob effect to the baseline ServerPlayer. Legitimate
- *       clients skip rendering the body.</li>
- *   <li><b>Identity scrubbing</b> — hack clients that bypass PlayerInfo
- *       REMOVE will see whatever profile entry was most recently ADD'd. The
- *       removal alone leaves them nothing to render, but if they also cache
- *       the pre-phantom entry, they would still know who it is. Full
- *       textures-stripping requires outbound packet rewriting via
- *       ProtocolLib; see {@link SkinCloak} which is wired when ProtocolLib
- *       is present.</li>
- * </ol>
+ * <h2>What this service now does</h2>
+ * <ul>
+ *   <li>Shadow mode: hide the shadow target's tab entry from observers
+ *       that are not the shadow controller itself. (The controller sees
+ *       the target in their own tab — locked-in decision — so we only
+ *       broadcast REMOVE_PLAYER for the target UUID to <em>other</em>
+ *       observers.)</li>
+ *   <li>When a new observer joins, re-apply the above policy for every
+ *       live shadow session so their initial tab is consistent.</li>
+ *   <li>Hold an optional reference to {@link SkinCloak} so ProtocolLib
+ *       can override textures if needed.</li>
+ * </ul>
+ *
+ * <p>Main-thread only.</p>
  */
 public final class PresentationService {
     private final Logger log;
-    private final DualPlayerRegistry registry;
-    /** Optional ProtocolLib-backed skin cloak; null when ProtocolLib is absent. */
+    private final SessionRegistry registry;
     private SkinCloak cloak;
 
-    public PresentationService(final Logger log, final DualPlayerRegistry registry) {
+    public PresentationService(final Logger log, final SessionRegistry registry) {
         this.log = log;
         this.registry = registry;
     }
 
-    /** Called at plugin enable, after ProtocolLib availability is determined. */
+    /** Attach the SkinCloak once ProtocolLib availability is determined. Nullable. */
     public void attachCloak(final SkinCloak cloak) {
         this.cloak = cloak;
     }
 
     /**
-     * Apply the current mount's presentation policy on every surface.
+     * Apply the current mount's presentation policy for a session. Called
+     * after every successful mount transition by Manager.
      */
-    public void refreshForSession(final DualPlayerSession session) {
+    public void refreshForSession(final Session session) {
         if (session == null) return;
-        final MountedIdentity identity = session.mountedIdentity();
-        if (identity == null) {
-            restoreBaselinePresentation(session);
-            return;
-        }
+        final MountedIdentity identity = session.currentIdentity();
+        dev.shadowcore.util.Diag.info(log, "pres",
+            "refreshForSession: controller=" + session.controllerUuid()
+            + " identity=" + (identity == null ? "none" : identity.kind() + ":" + identity.displayName()));
+        if (identity == null) return;
         switch (identity.kind()) {
             case MAIN, LOCAL -> {
                 if (cloak != null) cloak.clear(session.controllerUuid());
-                restoreBaselinePresentation(session);
-                hideControllerFromOthersIfDualBody(session);
+                // No special presentation needed. The ServerPlayer IS the
+                // identity; vanilla tab broadcasts handle the rest.
             }
             case SHADOW -> {
                 if (cloak != null) cloak.clear(session.controllerUuid());
-                hideControllerFromOthersIfDualBody(session);
-                hideShadowTargetFromTab(session);
+                hideShadowTargetFromOtherObservers(session);
             }
             case PHANTOM -> {
-                if (cloak != null) cloak.enableFor(session.controllerUuid());
-                applyPhantomPresentation(session);
+                // PHANTOM was a 3.0 workaround for dual-body visibility leaks.
+                // In 4.0 there is no second body, so there's nothing to hide
+                // at the presentation layer. If this kind is encountered in
+                // legacy DB state, treat it as MAIN/LOCAL.
+                if (cloak != null) cloak.clear(session.controllerUuid());
             }
         }
     }
 
     /**
-     * In dual-body modes, remove the controller-side UUID from every
-     * observer's PlayerInfo so they only see the mounted identity.
+     * Shadow mode: broadcast a PlayerInfoRemove for the shadow target's
+     * UUID to every observer, including the controller themselves. The tab
+     * list stays pre-shadow for everyone — no new entry appears for the
+     * target. The baseline stays in tab because its ServerPlayer is still
+     * in PlayerList.
      */
-    private void hideControllerFromOthersIfDualBody(final DualPlayerSession session) {
-        if (session.isSelfMounted()) return;
+    private void hideShadowTargetFromOtherObservers(final Session session) {
+        final ServerPlayer currentBody = session.current();
+        if (currentBody == null) return;
+        final UUID targetUuid = currentBody.getUUID();
         final UUID controllerUuid = session.controllerUuid();
-        final var removePacket = new ClientboundPlayerInfoRemovePacket(List.of(controllerUuid));
-        broadcastExceptSelf(session, removePacket);
-        session.realConnection().send(removePacket);
-    }
-
-    /**
-     * Shadow mode: hide the shadow target's tab entry from everyone.
-     * Sync §3.2: "Other players do not see shadow presence in the client
-     * player list either."
-     */
-    private void hideShadowTargetFromTab(final DualPlayerSession session) {
-        final ServerPlayer mounted = session.mounted();
-        if (mounted == null || mounted == session.controller()) return;
-        final UUID mountedUuid = mounted.getUUID();
-        final var removePacket = new ClientboundPlayerInfoRemovePacket(List.of(mountedUuid));
+        final var removePacket = new ClientboundPlayerInfoRemovePacket(List.of(targetUuid));
+        dev.shadowcore.util.Diag.info(log, "pres",
+            "hideShadowTargetFromOtherObservers: hiding " + targetUuid
+            + " from all observers (controller=" + controllerUuid + ")");
         Bukkit.getOnlinePlayers().forEach(p -> sendTo(p, removePacket));
     }
 
     /**
-     * Phantom presentation — remove baseline from everyone's tab.
-     */
-    private void applyPhantomPresentation(final DualPlayerSession session) {
-        final UUID baselineUuid = session.controller().getUUID();
-        final var removePacket = new ClientboundPlayerInfoRemovePacket(List.of(baselineUuid));
-        Bukkit.getOnlinePlayers().forEach(p -> sendTo(p, removePacket));
-    }
-
-    /**
-     * Restore the normal PlayerInfo entry for a session that exited
-     * SHADOW/PHANTOM. Broadcast the current mounted-side (or controller
-     * for self-mount) as ADD_PLAYER.
-     */
-    private void restoreBaselinePresentation(final DualPlayerSession session) {
-        final ServerPlayer visible = session.mounted() == null ? session.controller() : session.mounted();
-        if (visible == null) return;
-        try {
-            final var addPacket = new ClientboundPlayerInfoUpdatePacket(
-                EnumSet.of(
-                    ClientboundPlayerInfoUpdatePacket.Action.ADD_PLAYER,
-                    ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LISTED
-                ),
-                List.of(visible)
-            );
-            Bukkit.getOnlinePlayers().forEach(p -> sendTo(p, addPacket));
-        } catch (final RuntimeException ex) {
-            log.warning("restoreBaselinePresentation broadcast failed: " + ex.getMessage());
-        }
-    }
-
-    /**
-     * Re-broadcast mounts to a newly joined observer so their world view is
-     * consistent with current policy.
+     * Re-apply the shadow-tab-hide policy for a newly-joined observer, so
+     * their initial tab list is consistent with every active shadow
+     * session. Called from PlayerLifecycleListener on PlayerJoin.
      */
     public void onObserverJoined(final org.bukkit.entity.Player observer) {
-        for (final DualPlayerSession s : registry.all()) {
-            final MountedIdentity identity = s.mountedIdentity();
+        for (final Session s : registry.all()) {
+            final MountedIdentity identity = s.currentIdentity();
             if (identity == null) continue;
-            switch (identity.kind()) {
-                case MAIN, LOCAL -> {
-                    final ServerPlayer visible = s.mounted();
-                    if (visible == null) continue;
-                    try {
-                        sendTo(observer, new ClientboundPlayerInfoUpdatePacket(
-                            EnumSet.of(
-                                ClientboundPlayerInfoUpdatePacket.Action.ADD_PLAYER,
-                                ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LISTED
-                            ),
-                            List.of(visible)
-                        ));
-                        if (!s.isSelfMounted()) {
-                            sendTo(observer, new ClientboundPlayerInfoRemovePacket(List.of(s.controllerUuid())));
-                        }
-                    } catch (final RuntimeException ex) {
-                        log.warning("onObserverJoined MAIN/LOCAL failed: " + ex.getMessage());
-                    }
-                }
-                case SHADOW -> {
-                    if (s.mounted() != null && !s.isSelfMounted()) {
-                        sendTo(observer, new ClientboundPlayerInfoRemovePacket(List.of(s.mounted().getUUID())));
-                        sendTo(observer, new ClientboundPlayerInfoRemovePacket(List.of(s.controllerUuid())));
-                    }
-                }
-                case PHANTOM -> {
-                    sendTo(observer, new ClientboundPlayerInfoRemovePacket(List.of(s.controllerUuid())));
-                }
+            if (identity.kind() != MountedIdentity.Kind.SHADOW) continue;
+            final ServerPlayer currentBody = s.current();
+            if (currentBody == null) continue;
+            try {
+                sendTo(observer, new ClientboundPlayerInfoRemovePacket(
+                    List.of(currentBody.getUUID())));
+            } catch (final RuntimeException ex) {
+                log.warning("onObserverJoined shadow-hide failed: " + ex.getMessage());
             }
         }
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    //  Helpers
-    // ─────────────────────────────────────────────────────────────────
-
-    private void broadcastExceptSelf(final DualPlayerSession session,
-                                     final net.minecraft.network.protocol.Packet<?> packet) {
-        final UUID controllerUuid = session.controllerUuid();
-        Bukkit.getOnlinePlayers().forEach(p -> {
-            if (p.getUniqueId().equals(controllerUuid)) return;
-            sendTo(p, packet);
-        });
     }
 
     private static void sendTo(final org.bukkit.entity.Player observer,
@@ -207,7 +128,7 @@ public final class PresentationService {
             final ServerPlayer sp = ((org.bukkit.craftbukkit.entity.CraftPlayer) observer).getHandle();
             sp.connection.send(packet);
         } catch (final RuntimeException ex) {
-            // non-fatal — observer may have disconnected
+            // non-fatal — observer may have disconnected mid-send
         }
     }
 }

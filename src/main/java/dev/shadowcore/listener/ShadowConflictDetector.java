@@ -39,8 +39,23 @@ public final class ShadowConflictDetector implements Listener {
         final String arrivingName = event.getPlayer().getName();
         final UUID arrivingUuid = event.getPlayer().getUniqueId();
         final Optional<UUID> shadower = manager.shadowReservationFor(arrivingName);
-        if (shadower.isEmpty()) return;
-        if (shadower.get().equals(arrivingUuid)) return; // self-shadow, no conflict
+        if (shadower.isEmpty()) {
+            dev.shadowcore.util.Diag.trace(
+                java.util.logging.Logger.getLogger("ShadowCore-ShadowConflictDetector"),
+                "conflict", "onJoin: " + arrivingName + " — no shadow reservation for this name");
+            return;
+        }
+        if (shadower.get().equals(arrivingUuid)) {
+            dev.shadowcore.util.Diag.trace(
+                java.util.logging.Logger.getLogger("ShadowCore-ShadowConflictDetector"),
+                "conflict", "onJoin: " + arrivingName + " — self-shadow reservation, no conflict");
+            return;
+        }
+        dev.shadowcore.util.Diag.info(
+            java.util.logging.Logger.getLogger("ShadowCore-ShadowConflictDetector"),
+            "conflict", "CONFLICT: " + arrivingName + " (" + arrivingUuid
+            + ") arrived while shadowed by controller " + shadower.get()
+            + " — submitting ShadowConflictArrived");
         engine.submit(new EngineEvent.ShadowConflictArrived(
             shadower.get(), arrivingName, arrivingUuid, ResponseHandle.silent()));
     }

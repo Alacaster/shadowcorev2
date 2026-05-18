@@ -9,7 +9,6 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.level.ServerLevel;
 
 /**
  * Pre-mount .dat backups used to implement {@link
@@ -41,10 +40,16 @@ public final class MountBackup {
     private final Logger log;
     private final MinecraftServer server;
     private final File backupDir;
+    /**
+     * Lazily resolved on first {@link #datFile} call. At plugin enable,
+     * {@code server.overworld()} may be null (worlds are loaded later in
+     * startup), so we can't eagerly construct the playerdata path.
+     */
+    private volatile File playerDataDir;
+    /** True once we've logged the "playerdata unavailable" warning once. */
+    private volatile boolean warnedUnavailable;
     /** UUIDs whose pre-mount state was "no .dat existed" — restore means delete. */
     private final Set<UUID> wasAbsent = ConcurrentHashMap.newKeySet();
-    private volatile File playerDataDir;
-    private volatile boolean warnedPlayerDataUnavailable;
 
     public MountBackup(final Logger log, final MinecraftServer server, final File pluginDataDir) {
         this.log = log;
@@ -53,86 +58,146 @@ public final class MountBackup {
         if (!backupDir.exists() && !backupDir.mkdirs()) {
             log.warning("Could not create mount backup directory " + backupDir);
         }
+        // Deliberately NOT calling server.overworld() here — it may be null
+        // at plugin enable. playerDataDir resolves lazily on first use.
     }
 
     /** Capture the current .dat for a UUID about to be mounted. */
     public void capture(final UUID uuid) {
-        final File live = datFileOrNull(uuid);
-        if (live == null) return;
+        final File live = datFile(uuid);
+        if (live == null) {
+            dev.shadowcore.util.Diag.trace(log, "backup",
+                "capture: datFile resolved to null for " + uuid + " (playerdata dir not ready?)");
+            return;
+        }
         final File bak = backupFile(uuid);
         try {
             if (!live.exists()) {
                 wasAbsent.add(uuid);
+                dev.shadowcore.util.Diag.trace(log, "backup",
+                    "capture: no live .dat for " + uuid + " → marked wasAbsent");
                 if (bak.exists() && !bak.delete()) {
-                    log.warning("Could not clear stale backup " + bak);
+                    dev.shadowcore.util.Diag.warn(log, "backup",
+                        "Could not clear stale backup " + bak);
                 }
                 return;
             }
             wasAbsent.remove(uuid);
             Files.copy(live.toPath(), bak.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            dev.shadowcore.util.Diag.trace(log, "backup",
+                "capture: copied " + live.length() + "B " + live.getName() + " → " + bak.getName());
         } catch (final IOException ex) {
-            log.warning("MountBackup.capture failed for " + uuid + ": " + ex.getMessage());
+            dev.shadowcore.util.Diag.error(log, "backup",
+                "capture failed for " + uuid, ex);
         }
     }
 
     /** Restore the backup over the live .dat — used on DISCARD unmount. */
     public void restore(final UUID uuid) {
-        final File live = datFileOrNull(uuid);
-        if (live == null) return;
+        final File live = datFile(uuid);
+        if (live == null) {
+            dev.shadowcore.util.Diag.trace(log, "backup",
+                "restore: datFile resolved to null for " + uuid);
+            return;
+        }
         final File bak = backupFile(uuid);
         try {
             if (wasAbsent.remove(uuid)) {
+                dev.shadowcore.util.Diag.trace(log, "backup",
+                    "restore: uuid was marked wasAbsent → deleting live .dat post-discard");
                 if (live.exists() && !live.delete()) {
-                    log.warning("MountBackup.restore: could not delete live .dat after discard for " + uuid);
+                    dev.shadowcore.util.Diag.warn(log, "backup",
+                        "restore: could not delete live .dat after discard for " + uuid);
                 }
                 return;
             }
             if (!bak.exists()) {
-                log.warning("MountBackup.restore: no backup present for " + uuid + " — discard not applied");
+                dev.shadowcore.util.Diag.warn(log, "backup",
+                    "restore: no backup present for " + uuid + " — discard NOT applied");
                 return;
             }
             Files.copy(bak.toPath(), live.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            dev.shadowcore.util.Diag.info(log, "backup",
+                "restore: " + bak.length() + "B " + bak.getName() + " → " + live.getName() + " (DISCARD applied)");
             if (!bak.delete()) {
-                log.fine("Could not delete backup " + bak + " after restore (non-fatal)");
+                dev.shadowcore.util.Diag.trace(log, "backup",
+                    "could not delete backup " + bak + " after restore (non-fatal)");
             }
         } catch (final IOException ex) {
-            log.warning("MountBackup.restore failed for " + uuid + ": " + ex.getMessage());
+            dev.shadowcore.util.Diag.error(log, "backup",
+                "restore failed for " + uuid, ex);
         }
+    }
+
+    /**
+     * Returns true if a pre-mount backup currently exists for the given
+     * UUID. Used by reload/discard paths to decide whether a rollback can
+     * proceed at all.
+     */
+    public boolean hasBackup(final UUID uuid) {
+        if (uuid == null) return false;
+        final File bak = backupFile(uuid);
+        return bak != null && bak.exists();
     }
 
     /** Commit path — drop the backup, live .dat is canonical. */
     public void drop(final UUID uuid) {
         wasAbsent.remove(uuid);
         final File bak = backupFile(uuid);
-        if (bak.exists() && !bak.delete()) {
-            log.fine("Could not delete backup " + bak + " after commit (non-fatal)");
+        if (bak.exists()) {
+            if (!bak.delete()) {
+                dev.shadowcore.util.Diag.trace(log, "backup",
+                    "drop: could not delete backup " + bak + " after commit (non-fatal)");
+            } else {
+                dev.shadowcore.util.Diag.trace(log, "backup",
+                    "drop: removed backup " + bak.getName() + " (commit)");
+            }
+        } else {
+            dev.shadowcore.util.Diag.trace(log, "backup",
+                "drop: no backup to remove for " + uuid);
         }
     }
 
-    private File datFileOrNull(final UUID uuid) {
+    private File datFile(final UUID uuid) {
         final File dir = resolvePlayerDataDir();
         if (dir == null) return null;
         return new File(dir, uuid + ".dat");
     }
 
-    private File backupFile(final UUID uuid) {
-        return new File(backupDir, uuid + ".dat.bak");
+    /**
+     * Resolve the world's {@code playerdata} directory, memoized. If the
+     * overworld is still not ready (unlikely by the time any mount event
+     * fires, but possible in pathological startup ordering), we log once
+     * and return null so callers can no-op gracefully.
+     */
+    private File resolvePlayerDataDir() {
+        File cached = playerDataDir;
+        if (cached != null) return cached;
+        synchronized (this) {
+            cached = playerDataDir;
+            if (cached != null) return cached;
+            try {
+                final var overworld = server.overworld();
+                if (overworld == null) {
+                    if (!warnedUnavailable) {
+                        warnedUnavailable = true;
+                        log.warning("MountBackup: overworld not ready; DISCARD disposition unavailable until worlds load.");
+                    }
+                    return null;
+                }
+                final var world = overworld.getWorld();
+                if (world == null) return null;
+                cached = new File(world.getWorldFolder(), "playerdata");
+                playerDataDir = cached;
+                return cached;
+            } catch (final RuntimeException ex) {
+                log.warning("MountBackup: could not resolve playerdata dir: " + ex.getMessage());
+                return null;
+            }
+        }
     }
 
-    private File resolvePlayerDataDir() {
-        final File cached = this.playerDataDir;
-        if (cached != null) return cached;
-        final ServerLevel overworld = server.overworld();
-        if (overworld == null || overworld.getWorld() == null) {
-            if (!warnedPlayerDataUnavailable) {
-                warnedPlayerDataUnavailable = true;
-                log.warning("MountBackup: overworld is not ready yet; playerdata backup is temporarily unavailable.");
-            }
-            return null;
-        }
-        final File resolved = new File(overworld.getWorld().getWorldFolder(), "playerdata");
-        this.playerDataDir = resolved;
-        warnedPlayerDataUnavailable = false;
-        return resolved;
+    private File backupFile(final UUID uuid) {
+        return new File(backupDir, uuid + ".dat.bak");
     }
 }

@@ -1,9 +1,11 @@
 package dev.shadowcore.command;
 
+import dev.shadowcore.core.auth.AuthGateway;
 import dev.shadowcore.engine.EngineEvent;
 import dev.shadowcore.engine.EventEngine;
 import dev.shadowcore.engine.ResponseHandle;
 import java.util.List;
+import java.util.UUID;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.Bukkit;
 import org.bukkit.command.Command;
@@ -15,9 +17,11 @@ import org.jetbrains.annotations.NotNull;
 public final class ShadowCommand implements TabExecutor {
     private static final MiniMessage MM = MiniMessage.miniMessage();
     private final EventEngine engine;
+    private final AuthGateway auth;
 
-    public ShadowCommand(final EventEngine engine) {
+    public ShadowCommand(final EventEngine engine, final AuthGateway auth) {
         this.engine = engine;
+        this.auth = auth;
     }
 
     @Override
@@ -32,6 +36,7 @@ public final class ShadowCommand implements TabExecutor {
             return true;
         }
         final ResponseHandle resp = miniMessage -> p.sendMessage(MM.deserialize(miniMessage));
+        final UUID actor = auth.resolveControllerMojangUuid(p.getUniqueId());
         if (args.length == 0) {
             resp.reply("<yellow>Usage:</yellow> /shadow <target|logout [resetlocation]|discard|status>");
             return true;
@@ -40,11 +45,11 @@ public final class ShadowCommand implements TabExecutor {
         switch (first) {
             case "logout" -> {
                 final boolean reset = args.length >= 2 && args[1].equalsIgnoreCase("resetlocation");
-                engine.submit(new EngineEvent.ShadowLogout(p.getUniqueId(), reset, resp));
+                engine.submit(new EngineEvent.ShadowLogout(actor, reset, resp));
             }
-            case "discard" -> engine.submit(new EngineEvent.ShadowDiscard(p.getUniqueId(), resp));
-            case "status" -> engine.submit(new EngineEvent.ShadowStatus(p.getUniqueId(), resp));
-            default -> engine.submit(new EngineEvent.ShadowMount(p.getUniqueId(), p.getName(), args[0], resp));
+            case "discard" -> engine.submit(new EngineEvent.ShadowDiscard(actor, resp));
+            case "status" -> engine.submit(new EngineEvent.ShadowStatus(actor, resp));
+            default -> engine.submit(new EngineEvent.ShadowMount(actor, p.getName(), args[0], resp));
         }
         return true;
     }

@@ -165,6 +165,20 @@ public final class Database implements AutoCloseable {
                     resolved_at  INTEGER NOT NULL
                 )
             """);
+
+            // Parking regions in use by active shadow sessions. Each row
+            // tracks one bedrock chamber so the plugin can clean it up
+            // (delete the .mca file from disk) on shadow end or on
+            // startup if the previous shutdown was unclean.
+            s.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS parking_regions (
+                    controller_uuid  TEXT PRIMARY KEY,
+                    world_name       TEXT NOT NULL,
+                    region_x         INTEGER NOT NULL,
+                    region_z         INTEGER NOT NULL,
+                    created_at       INTEGER NOT NULL
+                )
+            """);
         }
     }
 
@@ -241,8 +255,14 @@ public final class Database implements AutoCloseable {
             ps.setLong(4, r.createdAt());
             ps.setLong(5, r.lastMountedAt());
             ps.setInt(6, r.renameable() ? 1 : 0);
-            ps.executeUpdate();
-        } catch (final SQLException e) { log.warning("insertProfile: " + e.getMessage()); }
+            final int rows = ps.executeUpdate();
+            dev.shadowcore.util.Diag.info(log, "db",
+                "insertProfile: owner=" + r.ownerUuid() + " suffix=" + r.suffix()
+                + " profileUuid=" + r.profileUuid() + " rows=" + rows);
+        } catch (final SQLException e) {
+            dev.shadowcore.util.Diag.error(log, "db",
+                "insertProfile FAILED: owner=" + r.ownerUuid() + " suffix=" + r.suffix(), e);
+        }
     }
 
     public Optional<ProfileRecord> findProfileBySuffix(final UUID ownerUuid, final String suffix) {
@@ -484,16 +504,29 @@ public final class Database implements AutoCloseable {
             ps.setInt(8, r.deferredRestoreMain() ? 1 : 0);
             ps.setInt(9, r.deferredRestoreResetPosition() ? 1 : 0);
             ps.setString(10, r.deferredRestoreReason());
-            ps.executeUpdate();
-        } catch (final SQLException e) { log.warning("saveSession: " + e.getMessage()); }
+            final int rows = ps.executeUpdate();
+            dev.shadowcore.util.Diag.info(log, "db",
+                "saveSession: controller=" + r.controllerUuid() + " activeProfile=" + r.activeProfileUuid()
+                + " shadowTarget=" + r.shadowTargetName() + " conflict=" + r.conflictFrozen()
+                + " rows=" + rows);
+        } catch (final SQLException e) {
+            dev.shadowcore.util.Diag.error(log, "db",
+                "saveSession FAILED for controller=" + r.controllerUuid() + " — session NOT persisted; "
+                + "on next join the controller will restore from whatever was previously written", e);
+        }
     }
 
     public void clearSession(final UUID controllerUuid) {
         try (final PreparedStatement ps = connection.prepareStatement(
                 "DELETE FROM sessions WHERE controller_uuid = ?")) {
             ps.setString(1, controllerUuid.toString());
-            ps.executeUpdate();
-        } catch (final SQLException e) { log.warning("clearSession: " + e.getMessage()); }
+            final int rows = ps.executeUpdate();
+            dev.shadowcore.util.Diag.info(log, "db",
+                "clearSession: controller=" + controllerUuid + " rows=" + rows);
+        } catch (final SQLException e) {
+            dev.shadowcore.util.Diag.error(log, "db",
+                "clearSession FAILED for controller=" + controllerUuid, e);
+        }
     }
 
     private SessionRecord readSession(final ResultSet rs) throws SQLException {
@@ -594,5 +627,79 @@ public final class Database implements AutoCloseable {
             }
         } catch (final SQLException e) { log.warning("lookupKnownName: " + e.getMessage()); }
         return Optional.empty();
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  Parking regions (per-controller bedrock-chamber bookkeeping)
+    // ────────────────────────────────────────────────────────────────
+
+    /** One parking region record. */
+    public record ParkingRegion(UUID controllerUuid, String worldName,
+                                int regionX, int regionZ, long createdAt) {}
+
+    public void recordParkingRegion(final UUID controllerUuid, final String worldName,
+                                    final int regionX, final int regionZ) {
+        try (final PreparedStatement ps = connection.prepareStatement("""
+                INSERT INTO parking_regions (controller_uuid, world_name, region_x, region_z, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(controller_uuid) DO UPDATE SET
+                    world_name = excluded.world_name,
+                    region_x   = excluded.region_x,
+                    region_z   = excluded.region_z,
+                    created_at = excluded.created_at
+            """)) {
+            ps.setString(1, controllerUuid.toString());
+            ps.setString(2, worldName);
+            ps.setInt(3, regionX);
+            ps.setInt(4, regionZ);
+            ps.setLong(5, System.currentTimeMillis());
+            ps.executeUpdate();
+            log.fine("recordParkingRegion: " + controllerUuid
+                + " -> " + worldName + " (" + regionX + "," + regionZ + ")");
+        } catch (final SQLException e) { log.warning("recordParkingRegion: " + e.getMessage()); }
+    }
+
+    public Optional<ParkingRegion> getParkingRegion(final UUID controllerUuid) {
+        try (final PreparedStatement ps = connection.prepareStatement(
+                "SELECT controller_uuid, world_name, region_x, region_z, created_at "
+                + "FROM parking_regions WHERE controller_uuid = ?")) {
+            ps.setString(1, controllerUuid.toString());
+            try (final ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return Optional.of(new ParkingRegion(
+                        UUID.fromString(rs.getString(1)),
+                        rs.getString(2),
+                        rs.getInt(3),
+                        rs.getInt(4),
+                        rs.getLong(5)));
+                }
+            }
+        } catch (final SQLException e) { log.warning("getParkingRegion: " + e.getMessage()); }
+        return Optional.empty();
+    }
+
+    public void clearParkingRegion(final UUID controllerUuid) {
+        try (final PreparedStatement ps = connection.prepareStatement(
+                "DELETE FROM parking_regions WHERE controller_uuid = ?")) {
+            ps.setString(1, controllerUuid.toString());
+            ps.executeUpdate();
+        } catch (final SQLException e) { log.warning("clearParkingRegion: " + e.getMessage()); }
+    }
+
+    public java.util.List<ParkingRegion> loadAllParkingRegions() {
+        final java.util.List<ParkingRegion> out = new java.util.ArrayList<>();
+        try (final Statement s = connection.createStatement();
+             final ResultSet rs = s.executeQuery(
+                 "SELECT controller_uuid, world_name, region_x, region_z, created_at FROM parking_regions")) {
+            while (rs.next()) {
+                out.add(new ParkingRegion(
+                    UUID.fromString(rs.getString(1)),
+                    rs.getString(2),
+                    rs.getInt(3),
+                    rs.getInt(4),
+                    rs.getLong(5)));
+            }
+        } catch (final SQLException e) { log.warning("loadAllParkingRegions: " + e.getMessage()); }
+        return out;
     }
 }

@@ -2,9 +2,9 @@ package dev.shadowcore.manager;
 
 import com.mojang.authlib.GameProfile;
 import dev.shadowcore.core.auth.AuthGateway;
-import dev.shadowcore.core.nms.DualPlayerRegistry;
-import dev.shadowcore.core.nms.DualPlayerSession;
-import dev.shadowcore.core.nms.MountKernel;
+import dev.shadowcore.core.swap.SessionRegistry;
+import dev.shadowcore.core.swap.Session;
+import dev.shadowcore.core.swap.IdentitySwap;
 import dev.shadowcore.engine.EngineEvent;
 import dev.shadowcore.model.MountDisposition;
 import dev.shadowcore.model.MountedIdentity;
@@ -30,7 +30,7 @@ import org.bukkit.entity.Player;
  * The orchestration manager: dispatches every {@link EngineEvent}, applies
  * the spec's command-by-state matrix (§11) and automatic-event rules (§12),
  * merges contradictory intentions using the priority rules (§10), produces
- * a reconcile plan, and hands it to the {@link MountKernel}.
+ * a reconcile plan, and hands it to the {@link IdentitySwap}.
  *
  * <p>This class is the single place where spec section references correspond
  * to executable logic. Every rejected command produces a user-visible
@@ -42,23 +42,24 @@ import org.bukkit.entity.Player;
 public final class Manager {
     private final Logger log;
     private final Database db;
-    private final MountKernel kernel;
-    private final DualPlayerRegistry registry;
+    private final IdentitySwap swap;
+    private final SessionRegistry registry;
     private final PresentationService presentation;
     private final AuthGateway auth;
     /** Optional — attached by the plugin after EventEngine + SkinResolver are built. */
     private dev.shadowcore.engine.EventEngine engine;
     private dev.shadowcore.core.auth.SkinResolver skinResolver;
+    private dev.shadowcore.core.forward.ControllerBoundState forwarding;
 
     /** Active shadow reservations: lowercase(target) → controller UUID. */
     private final Map<String, UUID> shadowReservations = new HashMap<>();
 
-    public Manager(final Logger log, final Database db, final MountKernel kernel,
-                   final DualPlayerRegistry registry, final PresentationService presentation,
+    public Manager(final Logger log, final Database db, final IdentitySwap swap,
+                   final SessionRegistry registry, final PresentationService presentation,
                    final AuthGateway auth) {
         this.log = log;
         this.db = db;
-        this.kernel = kernel;
+        this.swap = swap;
         this.registry = registry;
         this.presentation = presentation;
         this.auth = auth;
@@ -66,13 +67,39 @@ public final class Manager {
 
     public void attachEngine(final dev.shadowcore.engine.EventEngine engine) { this.engine = engine; }
     public void attachSkinResolver(final dev.shadowcore.core.auth.SkinResolver r) { this.skinResolver = r; }
+    public void attachForwarding(final dev.shadowcore.core.forward.ControllerBoundState f) { this.forwarding = f; }
+
+    /**
+     * Refresh presentation and apply controller-bound forwarding
+     * (op/perms/skin) for the given session. Called after every successful
+     * mount transition. Replaces the prior pattern of calling
+     * {@code presentation.refreshForSession} alone.
+     */
+    private void refreshAndForward(final dev.shadowcore.core.swap.Session session) {
+        presentation.refreshForSession(session);
+        if (forwarding != null) {
+            // Schedule on the next tick so the active ServerPlayer is fully
+            // joined and Bukkit.getPlayer(...) returns it. After the initial
+            // mount on a transfer-reconnect, this can race otherwise.
+            org.bukkit.Bukkit.getScheduler().runTask(
+                org.bukkit.Bukkit.getPluginManager().getPlugin("ShadowCore"),
+                () -> forwarding.applyForCurrentIdentity(session)
+            );
+        }
+    }
 
     /** Rebuild runtime state from the orchestration DB on plugin enable. */
     public void bootstrap() {
         shadowReservations.clear();
-        for (final SessionRecord s : db.loadAllSessions()) {
+        final var sessions = db.loadAllSessions();
+        dev.shadowcore.util.Diag.info(log, "mgr",
+            "bootstrap: loaded " + sessions.size() + " session records from db");
+        for (final SessionRecord s : sessions) {
             if (s.shadowTargetName() != null) {
                 shadowReservations.put(Naming.normalizeKey(s.shadowTargetName()), s.controllerUuid());
+                dev.shadowcore.util.Diag.trace(log, "mgr",
+                    "bootstrap: restored shadow reservation " + s.shadowTargetName()
+                    + " → " + s.controllerUuid());
             }
         }
     }
@@ -82,6 +109,8 @@ public final class Manager {
     // ────────────────────────────────────────────────────────────────
 
     public void dispatch(final EngineEvent event) {
+        dev.shadowcore.util.Diag.trace(log, "mgr",
+            "dispatch: " + event.getClass().getSimpleName());
         switch (event) {
             // Local profile
             case EngineEvent.ProfileCreate e     -> onProfileCreate(e);
@@ -114,6 +143,13 @@ public final class Manager {
     // ────────────────────────────────────────────────────────────────
 
     private SessionState stateOf(final UUID controllerUuid) {
+        final SessionState s = stateOfInner(controllerUuid);
+        dev.shadowcore.util.Diag.trace(log, "mgr",
+            "stateOf(" + controllerUuid + ") = " + s);
+        return s;
+    }
+
+    private SessionState stateOfInner(final UUID controllerUuid) {
         if (!registry.byController(controllerUuid).isPresent()) return SessionState.DISCONNECTED;
         final SessionRecord s = db.loadSession(controllerUuid).orElse(null);
         if (s == null) return SessionState.MAIN_MOUNTED;
@@ -130,20 +166,28 @@ public final class Manager {
     private void onProfileCreate(final EngineEvent.ProfileCreate e) {
         // §11 Main/Local: allowed. Shadow: allowed (metadata only). Shell: reject.
         final SessionState st = stateOf(e.actor());
+        dev.shadowcore.util.Diag.info(log, "mgr",
+            "onProfileCreate: actor=" + e.actor() + " suffix=" + e.suffix() + " currentState=" + st);
         if (st == SessionState.CONFLICT_SPECTATOR_SHELL) {
+            dev.shadowcore.util.Diag.trace(log, "mgr", "onProfileCreate rejected: CONFLICT_SPECTATOR_SHELL");
             e.response().reply("<red>The deferred restore must finish first.</red>");
             return;
         }
         if (st == SessionState.DISCONNECTED) {
+            dev.shadowcore.util.Diag.trace(log, "mgr", "onProfileCreate rejected: DISCONNECTED");
             e.response().reply("<red>No player object exists.</red>");
             return;
         }
         final String suffix = Naming.normalizeSuffix(e.suffix());
         if (!Naming.isValidSuffix(suffix)) {
+            dev.shadowcore.util.Diag.trace(log, "mgr",
+                "onProfileCreate rejected: invalid suffix '" + suffix + "'");
             e.response().reply("<red>Invalid suffix. Use up to 10 alphanumeric characters.</red>");
             return;
         }
         if (db.findProfileBySuffix(e.actor(), suffix).isPresent()) {
+            dev.shadowcore.util.Diag.trace(log, "mgr",
+                "onProfileCreate rejected: suffix '" + suffix + "' already in use");
             e.response().reply("<red>That suffix is already in use.</red>");
             return;
         }
@@ -152,55 +196,81 @@ public final class Manager {
         final Player player = Bukkit.getPlayer(e.actor());
         final boolean bypass = player != null && player.hasPermission("shadowcore.profile.bypass-limit");
         if (count >= limit && !bypass) {
+            dev.shadowcore.util.Diag.trace(log, "mgr",
+                "onProfileCreate rejected: limit reached (" + count + "/" + limit + ")");
             e.response().reply("<red>Profile limit reached (" + limit + "). Ask an admin to raise it.</red>");
             return;
         }
         final UUID newProfileUuid = UUID.randomUUID();
         db.insertProfile(new Database.ProfileRecord(
             newProfileUuid, e.actor(), suffix, System.currentTimeMillis(), 0L, true));
+        dev.shadowcore.util.Diag.info(log, "mgr",
+            "onProfileCreate: inserted profile record profileUuid=" + newProfileUuid + " suffix=" + suffix);
         // Pre-populate the GameProfileCache with the reconstructed display name.
         final String base = db.getAccountName(e.actor()).orElse(e.actorName());
         final String display = Naming.reconstructDisplayName(base, suffix);
-        Bukkit.getServer().getLogger().info("ShadowCore: created local profile " + display
-            + " for controller " + base + " (" + e.actor() + ")");
+        dev.shadowcore.util.Diag.info(log, "mgr",
+            "onProfileCreate COMPLETE: " + display + " (profileUuid=" + newProfileUuid + ")");
         e.response().reply("<green>Created local profile</green> <yellow>" + display + "</yellow><green>.</green>");
     }
 
     private void onProfileSwitch(final EngineEvent.ProfileSwitch e) {
         final SessionState st = stateOf(e.actor());
+        dev.shadowcore.util.Diag.info(log, "mgr",
+            "onProfileSwitch: actor=" + e.actor() + " suffix=" + e.suffix() + " currentState=" + st);
         // §11: Main/Local allowed, Shadow rejected, Shell rejected.
         if (st == SessionState.SHADOW_MOUNTED) {
+            dev.shadowcore.util.Diag.trace(log, "mgr", "onProfileSwitch rejected: SHADOW_MOUNTED");
             e.response().reply("<red>Cannot switch profile while shadowing. End shadow first.</red>");
             return;
         }
         if (st == SessionState.CONFLICT_SPECTATOR_SHELL) {
+            dev.shadowcore.util.Diag.trace(log, "mgr", "onProfileSwitch rejected: CONFLICT_SPECTATOR_SHELL");
             e.response().reply("<red>The deferred restore must finish first.</red>");
             return;
         }
         if (st == SessionState.DISCONNECTED) {
+            dev.shadowcore.util.Diag.trace(log, "mgr", "onProfileSwitch rejected: DISCONNECTED");
             e.response().reply("<red>Not connected.</red>");
             return;
         }
         final Optional<ProfileRecord> target = db.findProfileBySuffix(e.actor(), Naming.normalizeSuffix(e.suffix()));
-        if (target.isEmpty()) { e.response().reply("<red>No profile with that suffix.</red>"); return; }
+        if (target.isEmpty()) {
+            dev.shadowcore.util.Diag.warn(log, "mgr",
+                "onProfileSwitch: no profile with suffix '" + e.suffix() + "' for actor " + e.actor());
+            e.response().reply("<red>No profile with that suffix.</red>");
+            return;
+        }
 
-        final DualPlayerSession session = registry.byController(e.actor()).orElse(null);
-        if (session == null) { e.response().reply("<red>No runtime session.</red>"); return; }
+        final Session session = registry.byController(e.actor()).orElse(null);
+        if (session == null) {
+            dev.shadowcore.util.Diag.error(log, "mgr",
+                "onProfileSwitch: stateOf said not-DISCONNECTED but registry has no session for " + e.actor()
+                + " — registry/state desync");
+            e.response().reply("<red>No runtime session.</red>");
+            return;
+        }
 
         final ProfileRecord pr = target.get();
         final ProfileIdentity newBaseline = ProfileIdentity.local(e.actor(), pr.profileUuid(), pr.suffix());
-        final String base = db.getAccountName(e.actor()).orElse(session.controller().getGameProfile().name());
+        final String base = db.getAccountName(e.actor()).orElse(dev.shadowcore.core.nms.NmsCompat.profileName(session.controller().getGameProfile()));
         final String display = Naming.reconstructDisplayName(base, pr.suffix());
         final MountedIdentity next = MountedIdentity.ofBaseline(newBaseline, display);
+        dev.shadowcore.util.Diag.trace(log, "mgr",
+            "onProfileSwitch: invoking swap.swap to " + display + " (profileUuid=" + pr.profileUuid() + ")");
 
-        final boolean ok = kernel.swap(session, next, MountDisposition.COMMIT);
+        final boolean ok = swap.swap(session, next, MountDisposition.COMMIT);
         if (!ok) {
+            dev.shadowcore.util.Diag.error(log, "mgr",
+                "onProfileSwitch: swap.swap returned false — switch aborted");
             e.response().reply("<red>Profile switch failed.</red>");
             return;
         }
         db.touchProfileMounted(pr.profileUuid());
         persistSession(e.actor(), pr.profileUuid(), null, null, false, false, null, false, true, null);
-        presentation.refreshForSession(session);
+        refreshAndForward(session);
+        dev.shadowcore.util.Diag.info(log, "mgr",
+            "onProfileSwitch COMPLETE: actor=" + e.actor() + " now mounted as " + display);
         e.response().reply("<green>Mounted</green> <yellow>" + display + "</yellow><green>.</green>");
     }
 
@@ -268,7 +338,7 @@ public final class Manager {
 
     private void onProfileDiscard(final EngineEvent.ProfileDiscard e) {
         final SessionState st = stateOf(e.actor());
-        final DualPlayerSession session = registry.byController(e.actor()).orElse(null);
+        final Session session = registry.byController(e.actor()).orElse(null);
         if (session == null) { e.response().reply("<red>Not connected.</red>"); return; }
 
         // §11: discard means different things per state.
@@ -281,7 +351,7 @@ public final class Manager {
                 final String display = baseline.isMain() ? baseName
                     : Naming.reconstructDisplayName(baseName, baseline.suffix());
                 final MountedIdentity restored = MountedIdentity.ofBaseline(baseline, display);
-                kernel.swap(session, restored, MountDisposition.DISCARD);
+                swap.swap(session, restored, MountDisposition.DISCARD);
                 clearShadowReservation(sess.shadowTargetName());
                 persistSession(e.actor(),
                     baseline.isMain() ? null : baseline.profileUuid(),
@@ -296,25 +366,28 @@ public final class Manager {
                 final String display = baseline.isMain() ? baseName
                     : Naming.reconstructDisplayName(baseName, baseline.suffix());
                 final MountedIdentity restored = MountedIdentity.ofBaseline(baseline, display);
-                kernel.resolveDeferredRestore(session, restored, sess.deferredRestoreResetPosition(), GameMode.SURVIVAL);
+                swap.resolveDeferredRestore(session, restored, sess.deferredRestoreResetPosition(), GameMode.SURVIVAL);
                 persistSession(e.actor(),
                     baseline.isMain() ? null : baseline.profileUuid(),
                     null, null, false, false, null, false, true, null);
                 e.response().reply("<green>Deferred restore resolved.</green>");
             }
             case MAIN_MOUNTED, LOCAL_PROFILE_MOUNTED -> {
-                // Spec §11: "Reload the current identity from the current
-                // discard point." The kernel's reload() path does this
-                // through vanilla load — for a dual-body mount it swaps the
-                // current mount out with DISCARD disposition (restoring
-                // the pre-mount .dat backup) and remounts; for a self-mount
-                // it invokes PlayerList.load directly.
-                final boolean ok = kernel.reload(session);
-                if (!ok) {
-                    e.response().reply("<red>Discard failed. See server log.</red>");
-                    return;
-                }
-                e.response().reply("<green>Live mount changes discarded.</green>");
+                // The original spec §11 row allows operator-gated discard
+                // here ("Reload the current identity from the current
+                // discard point"), but that creates an item-duping vector:
+                // drop items on the ground, run /lprofile discard, the
+                // .dat rolls back to a state that still has those items,
+                // while the dropped item entities remain in the world.
+                // Even gated to operators this is a footgun. Until we have
+                // a mechanism to also clean up drops/effects/world changes
+                // made during the mount window, we reject discard for
+                // non-shadow live-mount states. The legitimate discard use
+                // case is shadow anonymity, which the SHADOW_MOUNTED branch
+                // above handles cleanly.
+                e.response().reply("<red>/lprofile discard only applies during a shadow session. " +
+                    "It is intentionally disabled for normal mounted states because rolling back " +
+                    "inventory while leaving dropped items in the world would dupe items.</red>");
             }
             case DISCONNECTED -> e.response().reply("<red>Not connected.</red>");
         }
@@ -330,17 +403,17 @@ public final class Manager {
             e.response().reply("<yellow>Already on main.</yellow>");
             return;
         }
-        final DualPlayerSession session = registry.byController(e.actor()).orElse(null);
+        final Session session = registry.byController(e.actor()).orElse(null);
         if (session == null) { e.response().reply("<red>Not connected.</red>"); return; }
         final ProfileIdentity mainId = ProfileIdentity.main(e.actor());
-        final String baseName = db.getAccountName(e.actor()).orElse(session.controller().getGameProfile().name());
+        final String baseName = db.getAccountName(e.actor()).orElse(dev.shadowcore.core.nms.NmsCompat.profileName(session.controller().getGameProfile()));
         final MountedIdentity mainMount = MountedIdentity.ofBaseline(mainId, baseName);
         // If currently shadowing, end shadow first (COMMIT by default).
         final SessionRecord sess = db.loadSession(e.actor()).orElse(null);
         if (sess != null && sess.isShadowing()) clearShadowReservation(sess.shadowTargetName());
-        kernel.swap(session, mainMount, MountDisposition.COMMIT);
+        swap.swap(session, mainMount, MountDisposition.COMMIT);
         persistSession(e.actor(), null, null, null, false, false, null, false, true, null);
-        presentation.refreshForSession(session);
+        refreshAndForward(session);
         e.response().reply("<green>Returned to main.</green>");
     }
 
@@ -420,7 +493,7 @@ public final class Manager {
     }
 
     private void onShadowNameResolved(final EngineEvent.ShadowNameResolved e) {
-        final DualPlayerSession session = registry.byController(e.actor()).orElse(null);
+        final Session session = registry.byController(e.actor()).orElse(null);
         if (session == null) { e.response().reply("<red>Not connected.</red>"); return; }
         final SessionRecord sess = db.loadSession(e.actor()).orElse(null);
         final ProfileIdentity baseline = baselineFromSession(e.actor(), sess);
@@ -434,7 +507,7 @@ public final class Manager {
 
         // If currently shadowing something else, COMMIT the current target first.
         final MountDisposition oldDisp = MountDisposition.COMMIT;
-        final boolean ok = kernel.swap(session, mount, oldDisp);
+        final boolean ok = swap.swap(session, mount, oldDisp);
         if (!ok) {
             e.response().reply("<red>Shadow mount failed.</red>");
             return;
@@ -444,7 +517,7 @@ public final class Manager {
             baseline.isMain() ? null : baseline.profileUuid(),
             e.targetName(), e.resolvedUuid(), selfShadow,
             false, null, false, true, null);
-        presentation.refreshForSession(session);
+        refreshAndForward(session);
         e.response().reply("<green>Shadowing</green> <yellow>" + e.targetName() + "</yellow><green>.</green>");
     }
 
@@ -454,19 +527,19 @@ public final class Manager {
             e.response().reply("<red>No shadow session is active.</red>");
             return;
         }
-        final DualPlayerSession session = registry.byController(e.actor()).orElseThrow();
+        final Session session = registry.byController(e.actor()).orElseThrow();
         final SessionRecord sess = db.loadSession(e.actor()).orElseThrow();
         final ProfileIdentity baseline = baselineFromSession(e.actor(), sess);
         final String baseName = db.getAccountName(e.actor()).orElse("player");
         final String display = baseline.isMain() ? baseName
             : Naming.reconstructDisplayName(baseName, baseline.suffix());
         final MountedIdentity restored = MountedIdentity.ofBaseline(baseline, display);
-        kernel.swap(session, restored, MountDisposition.COMMIT);
+        swap.swap(session, restored, MountDisposition.COMMIT);
         clearShadowReservation(sess.shadowTargetName());
         persistSession(e.actor(),
             baseline.isMain() ? null : baseline.profileUuid(),
             null, null, false, false, null, false, true, null);
-        presentation.refreshForSession(session);
+        refreshAndForward(session);
         if (e.resetLocation()) {
             // Teleport the mounted (now baseline) body to its saved spawn.
             final Player p = Bukkit.getPlayer(e.actor());
@@ -483,19 +556,19 @@ public final class Manager {
             e.response().reply("<red>No shadow session is active.</red>");
             return;
         }
-        final DualPlayerSession session = registry.byController(e.actor()).orElseThrow();
+        final Session session = registry.byController(e.actor()).orElseThrow();
         final SessionRecord sess = db.loadSession(e.actor()).orElseThrow();
         final ProfileIdentity baseline = baselineFromSession(e.actor(), sess);
         final String baseName = db.getAccountName(e.actor()).orElse("player");
         final String display = baseline.isMain() ? baseName
             : Naming.reconstructDisplayName(baseName, baseline.suffix());
         final MountedIdentity restored = MountedIdentity.ofBaseline(baseline, display);
-        kernel.swap(session, restored, MountDisposition.DISCARD);
+        swap.swap(session, restored, MountDisposition.DISCARD);
         clearShadowReservation(sess.shadowTargetName());
         persistSession(e.actor(),
             baseline.isMain() ? null : baseline.profileUuid(),
             null, null, false, false, null, false, true, null);
-        presentation.refreshForSession(session);
+        refreshAndForward(session);
         e.response().reply("<green>Shadow discarded.</green>");
     }
 
@@ -511,24 +584,34 @@ public final class Manager {
     // ────────────────────────────────────────────────────────────────
 
     private void onControllerJoin(final EngineEvent.ControllerJoin e) {
+        dev.shadowcore.util.Diag.info(log, "mgr",
+            "onControllerJoin: actor=" + e.actor() + " name=" + e.actorName());
         // §12: restore the persisted actual state exactly.
-        final DualPlayerSession session = registry.byController(e.actor()).orElse(null);
+        final Session session = registry.byController(e.actor()).orElse(null);
         if (session == null) {
-            log.warning("ControllerJoin for unknown session " + e.actor());
+            dev.shadowcore.util.Diag.warn(log, "mgr",
+                "ControllerJoin: registry has no session for " + e.actor() + " — registration path missed?");
             return;
         }
         final SessionRecord sess = db.loadSession(e.actor()).orElse(null);
         if (sess == null) {
             // Fresh controller — main mount.
+            dev.shadowcore.util.Diag.info(log, "mgr",
+                "ControllerJoin: fresh actor, no prior session — main mount");
             final MountedIdentity mainMount = MountedIdentity.ofBaseline(
                 ProfileIdentity.main(e.actor()), e.actorName());
-            kernel.mount(session, mainMount);
-            presentation.refreshForSession(session);
+            swap.mount(session, mainMount);
+            refreshAndForward(session);
             return;
         }
+        dev.shadowcore.util.Diag.info(log, "mgr",
+            "ControllerJoin: restoring persisted session: conflict=" + sess.conflictFrozen()
+            + " shadow=" + sess.isShadowing() + " shadowTarget=" + sess.shadowTargetName()
+            + " activeProfile=" + sess.activeProfileUuid());
         if (sess.conflictFrozen()) {
             // §12: restore the shell state.
-            kernel.enterConflictShell(session);
+            dev.shadowcore.util.Diag.trace(log, "mgr", "restoring conflict-spectator shell");
+            swap.enterConflictShell(session);
             return;
         }
         final ProfileIdentity baseline = baselineFromSession(e.actor(), sess);
@@ -537,37 +620,54 @@ public final class Manager {
             final MountedIdentity shadow = sess.shadowSelf()
                 ? MountedIdentity.ofPhantom(baseline, sess.shadowTargetName())
                 : MountedIdentity.ofShadow(baseline, sess.shadowTargetUuid(), sess.shadowTargetName());
-            kernel.mount(session, shadow);
+            dev.shadowcore.util.Diag.trace(log, "mgr",
+                "restoring shadow mount: " + (sess.shadowSelf() ? "PHANTOM" : "SHADOW")
+                + " → " + sess.shadowTargetName());
+            swap.mount(session, shadow);
             shadowReservations.put(Naming.normalizeKey(sess.shadowTargetName()), e.actor());
         } else {
             final String display = baseline.isMain() ? baseName
                 : Naming.reconstructDisplayName(baseName, baseline.suffix());
-            kernel.mount(session, MountedIdentity.ofBaseline(baseline, display));
+            dev.shadowcore.util.Diag.trace(log, "mgr",
+                "restoring local mount: " + display + " (baseline.isMain=" + baseline.isMain() + ")");
+            swap.mount(session, MountedIdentity.ofBaseline(baseline, display));
         }
-        presentation.refreshForSession(session);
+        refreshAndForward(session);
     }
 
     private void onControllerQuit(final EngineEvent.ControllerQuit e) {
-        final DualPlayerSession session = registry.byController(e.actor()).orElse(null);
-        if (session == null) return;
+        dev.shadowcore.util.Diag.info(log, "mgr",
+            "onControllerQuit: actor=" + e.actor());
+        final Session session = registry.byController(e.actor()).orElse(null);
+        if (session == null) {
+            dev.shadowcore.util.Diag.trace(log, "mgr",
+                "ControllerQuit: no session for " + e.actor() + " (already cleared)");
+            return;
+        }
         final SessionRecord sess = db.loadSession(e.actor()).orElse(null);
         if (sess != null && sess.conflictFrozen()) {
             // §12: do not save the shell as canonical — keep deferred restore metadata.
             // Just unmount the (non-existent) mounted side and record nothing new.
+            dev.shadowcore.util.Diag.trace(log, "mgr",
+                "ControllerQuit: conflict-frozen, preserving shell metadata, no persist");
         } else if (sess != null && sess.isShadowing()) {
             // §12: commit shadow changes on quit.
-            kernel.persist(session);
-            kernel.unmount(session, MountDisposition.COMMIT);
+            dev.shadowcore.util.Diag.trace(log, "mgr",
+                "ControllerQuit: shadowing — persist + commit unmount, keep reservation");
+            swap.persist(session);
+            swap.unmount(session, MountDisposition.COMMIT);
             // Keep the shadow reservation — on rejoin we reconstruct.
         } else {
-            kernel.persist(session);
-            kernel.unmount(session, MountDisposition.COMMIT);
+            dev.shadowcore.util.Diag.trace(log, "mgr",
+                "ControllerQuit: normal — persist + commit unmount");
+            swap.persist(session);
+            swap.unmount(session, MountDisposition.COMMIT);
         }
     }
 
     private void onShadowConflictArrived(final EngineEvent.ShadowConflictArrived e) {
         // §12: real target activates while another controller shadows that target.
-        final DualPlayerSession session = registry.byController(e.actor()).orElse(null);
+        final Session session = registry.byController(e.actor()).orElse(null);
         if (session == null) return;
         final SettingsRecord settings = db.loadSettings(e.actor());
         final MountDisposition disp = settings.autoDiscard() ? MountDisposition.DISCARD : MountDisposition.COMMIT;
@@ -576,9 +676,9 @@ public final class Manager {
         if (sess == null || !sess.isShadowing()) return;
         final ProfileIdentity baseline = baselineFromSession(e.actor(), sess);
         // Apply the disposition to the mounted-side via unmount, then enter shell.
-        kernel.unmount(session, disp);
+        swap.unmount(session, disp);
         clearShadowReservation(sess.shadowTargetName());
-        kernel.enterConflictShell(session);
+        swap.enterConflictShell(session);
         persistSession(e.actor(),
             baseline.isMain() ? null : baseline.profileUuid(),
             null, null, false,
@@ -602,7 +702,7 @@ public final class Manager {
         if (st != SessionState.CONFLICT_SPECTATOR_SHELL) return;
         if ("SPECTATOR".equalsIgnoreCase(e.toMode())) return;
 
-        final DualPlayerSession session = registry.byController(e.actor()).orElseThrow();
+        final Session session = registry.byController(e.actor()).orElseThrow();
         final SessionRecord sess = db.loadSession(e.actor()).orElseThrow();
         final ProfileIdentity baseline = baselineFromDeferred(e.actor(), sess);
         final String baseName = db.getAccountName(e.actor()).orElse("player");
@@ -610,11 +710,11 @@ public final class Manager {
             : Naming.reconstructDisplayName(baseName, baseline.suffix());
         final MountedIdentity restored = MountedIdentity.ofBaseline(baseline, display);
         final GameMode requested = parseGameMode(e.toMode());
-        kernel.resolveDeferredRestore(session, restored, sess.deferredRestoreResetPosition(), requested);
+        swap.resolveDeferredRestore(session, restored, sess.deferredRestoreResetPosition(), requested);
         persistSession(e.actor(),
             baseline.isMain() ? null : baseline.profileUuid(),
             null, null, false, false, null, false, true, null);
-        presentation.refreshForSession(session);
+        refreshAndForward(session);
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -645,9 +745,18 @@ public final class Manager {
                                 final UUID deferredRestoreProfile, final boolean deferredMain,
                                 final boolean deferredResetPos, final String deferredReason) {
         if (activeProfile == null && shadowTargetName == null && !conflictFrozen) {
+            dev.shadowcore.util.Diag.info(log, "mgr",
+                "persistSession: CLEARING session for " + controller + " (no active state)");
             db.clearSession(controller);
             return;
         }
+        dev.shadowcore.util.Diag.info(log, "mgr",
+            "persistSession: saving for " + controller
+            + " activeProfile=" + activeProfile
+            + " shadow=" + shadowTargetName + "(" + shadowTargetUuid + ")"
+            + " shadowSelf=" + shadowSelf
+            + " conflictFrozen=" + conflictFrozen
+            + " deferred=" + (deferredMain ? "MAIN" : String.valueOf(deferredRestoreProfile)));
         db.saveSession(new SessionRecord(controller, activeProfile, shadowTargetName, shadowTargetUuid,
             shadowSelf, conflictFrozen, deferredRestoreProfile, deferredMain, deferredResetPos, deferredReason));
     }

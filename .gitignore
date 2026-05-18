@@ -1,23 +1,10 @@
-# Gradle
-.gradle/
 build/
-out/
-
-# IntelliJ / IDEs
+.gradle/
 .idea/
 *.iml
-*.ipr
-*.iws
-
-# OS files
+out/
+bin/
+.vscode/
+*.class
+*.swp
 .DS_Store
-Thumbs.db
-
-# Run/test server output
-run/
-plugins/
-logs/
-world/
-world_nether/
-world_the_end/
-cache/

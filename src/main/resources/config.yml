@@ -1,16 +1,20 @@
-# ShadowCore 3.0 — orchestration-only configuration.
+# ShadowCore 4.0 — orchestration-only configuration.
 # The database holds per-controller settings; this file holds global defaults.
 
-# Default maximum local profiles per controller. Individual controllers can be
-# raised by operators via /lprofile setlimit <player> <limit>.
+# ── Profile policy ─────────────────────────────────────────────────────
+
+# Default maximum local profiles per controller. Individual controllers can
+# be raised by operators via /lprofile setlimit <player> <limit>.
 default-max-profiles: 2
 
-# Whether the plugin should attempt to reconstruct shadow reservations from the
-# database on enable. Turning off is a safety valve if your DB is corrupted.
+# ── Shadow conflict policy (spec §13) ──────────────────────────────────
+
+# When turned on at plugin enable, rebuild shadow reservations from the
+# database. Turn off as a safety valve if DB state is suspected corrupted.
 rebuild-shadow-reservations-on-enable: true
 
-# Default per-controller policy for forced-shadow-end (§13):
-#   true  = throw away the mounted shadow changes on conflict.
+# Default per-controller policy for forced-shadow-end on real-target-arrival:
+#   true  = discard mounted shadow changes on conflict.
 #   false = save them to the shadow target's .dat before entering shell.
 shadow-conflict-auto-discard-default: true
 
@@ -19,9 +23,53 @@ shadow-conflict-auto-discard-default: true
 #   false = preserve the shell's current location.
 shadow-conflict-reset-position-default: true
 
+# ── Shadow mount ──────────────────────────────────────────────────────
+
+# Where the shadow target's body appears when shadow mount begins:
+#   auto (default): if the target has a saved .dat file on this server,
+#     appear at the target's saved coords (as if logging in as them). If
+#     the target has no .dat (never played here), appear at the
+#     controller's current coords.
+#   target-saved: always use the target's saved coords if available; fall
+#     back to controller coords if the target has no .dat.
+#   controller-location: always appear at the controller's current coords,
+#     regardless of whether the target has a .dat.
+#   remote: always appear at server spawn.
+shadow-mount-spawn-policy: auto
+
+# On /shadow logout with commit disposition, roll the target's saved
+# coordinates back to their pre-shadow state so the next real login of the
+# target is at their original coords, not wherever the shadow wandered.
+# Does not apply to /shadow discard — discard always preserves original.
+shadow-logout-reset-target-position: true
+
+# ── Shadow anonymity defenses ─────────────────────────────────────────
+
+# On forced shadow end triggered by a controller's real pearl being pulled
+# (stasis activation), whether to discard shadow-mounted changes. Default
+# true preserves anonymity — the shadow target's .dat looks as if no
+# shadow session happened.
+pearl-stasis-shadow-discard: true
+
+# Entity types whose visibility is suppressed to non-controller observers
+# during an active shadow session, for entities owned by the shadow target.
+# These are the entity classes that, by their mere presence in the world,
+# signal "the owner is online" — e.g. pearls in stasis chambers.
+# Extending this list requires that the suppressor supports the type.
+shadow-target-visibility-suppression:
+  - minecraft:ender_pearl
+
+# ── Skin cache ────────────────────────────────────────────────────────
+
 # TTL for the Mojang sessionserver skin cache (minutes). When a /shadow
-# target resolves to a real Mojang account, we fetch their skin texture +
-# signature once and cache it here so the mounted doll renders as the
-# target. Set to 0 to disable caching (not recommended — every shadow will
-# hit sessionserver).
+# target resolves to a real Mojang account, fetch their skin texture +
+# signature once and cache here. 0 disables caching (not recommended).
 skin-cache-minutes: 60
+
+# ── Diagnostics ───────────────────────────────────────────────────────
+
+# Verbose diagnostic logging. When true, ShadowCore emits detailed trace
+# output. Useful during development and bug reports. Set to false for
+# production once stable; non-trace diagnostics (warnings, errors) still
+# emit regardless.
+verbose-diagnostics: true

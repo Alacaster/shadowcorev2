@@ -1,6 +1,7 @@
 package dev.shadowcore.core.auth;
 
 import com.mojang.authlib.GameProfile;
+import dev.shadowcore.core.nms.NmsCompat;
 import dev.shadowcore.model.ProfileIdentity;
 import dev.shadowcore.store.Database;
 import dev.shadowcore.store.Database.ProfileRecord;
@@ -13,7 +14,6 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
-import org.bukkit.event.player.PlayerLoginEvent;
 
 /**
  * Login interception and name-resolution authority.
@@ -57,6 +57,7 @@ public final class AuthGateway implements Listener {
     private final Logger log;
     private final MinecraftServer server;
     private final Database db;
+    private dev.shadowcore.core.swap.PendingSwapRegistry pendingSwaps; // optional; set after construction
 
     public AuthGateway(final Logger log, final MinecraftServer server, final Database db) {
         this.log = log;
@@ -65,30 +66,33 @@ public final class AuthGateway implements Listener {
     }
 
     /**
+     * Wire up the pending-swap registry after construction. The registry is
+     * needed during {@link #onAsyncPreLogin} to detect transfer-reconnects
+     * that should be placed on a non-main identity. If never set (skeleton
+     * phase), pre-login falls through to normal resolution.
+     */
+    public void attachPendingSwaps(final dev.shadowcore.core.swap.PendingSwapRegistry pendingSwaps) {
+        this.pendingSwaps = pendingSwaps;
+    }
+
+    /**
      * Populate the profile cache with every known local profile identity.
      * Called once at plugin enable.
      */
     public void bootstrap() {
+        final Object cache = NmsCompat.getProfileCache(server);
+        if (cache == null) {
+            log.warning("AuthGateway: profile cache unavailable — local profile names will not pre-resolve.");
+            return;
+        }
         int loaded = 0;
         for (final ProfileRecord p : db.listAllProfiles()) {
             final String base = db.getAccountName(p.ownerUuid()).orElse("player");
             final String displayName = Naming.reconstructDisplayName(base, p.suffix());
-            addProfileToServerCache(new GameProfile(p.profileUuid(), displayName));
+            NmsCompat.addToProfileCache(cache, new GameProfile(p.profileUuid(), displayName));
             loaded++;
         }
         if (loaded > 0) log.info("AuthGateway: pre-populated " + loaded + " local profile names into the GameProfileCache.");
-    }
-
-    private void addProfileToServerCache(final GameProfile profile) {
-        try {
-            final var getProfileCache = server.getClass().getMethod("getProfileCache");
-            final Object cache = getProfileCache.invoke(server);
-            if (cache == null) return;
-            final var add = cache.getClass().getMethod("add", GameProfile.class);
-            add.invoke(cache, profile);
-        } catch (final ReflectiveOperationException ignored) {
-            // Mapping drift between minor versions: cache prepopulation is an optimization only.
-        }
     }
 
     /**
@@ -137,6 +141,31 @@ public final class AuthGateway implements Listener {
         return db.resolveSyntheticNameByUuid(uuid);
     }
 
+    /**
+     * Given the UUID of a Bukkit Player object, return the Mojang UUID of
+     * the human controller behind that player. If the input UUID is a
+     * known local profile, the profile's owner UUID is returned. Otherwise
+     * the input UUID is returned unchanged (it's already a Mojang UUID,
+     * either a real Mojang account or a synthetic one we created).
+     *
+     * <p>Sessions are keyed on the controller's Mojang UUID, never on the
+     * profile UUID, so any code path that submits engine events from a
+     * Bukkit Player must call this first to get the right session key.</p>
+     */
+    public UUID resolveControllerMojangUuid(final UUID joiningUuid) {
+        if (joiningUuid == null) return null;
+        try {
+            return db.findProfileByUuid(joiningUuid)
+                .map(p -> p.ownerUuid())
+                .orElse(joiningUuid);
+        } catch (final Exception ex) {
+            dev.shadowcore.util.Diag.warn(log, "auth",
+                "resolveControllerMojangUuid failed for " + joiningUuid
+                + ": " + ex.getMessage() + " — falling back to joining UUID");
+            return joiningUuid;
+        }
+    }
+
     // ────────────────────────────────────────────────────────────────
     //  Bukkit event hooks — pre-login rewriting.
     // ────────────────────────────────────────────────────────────────
@@ -158,34 +187,91 @@ public final class AuthGateway implements Listener {
     public void onAsyncPreLogin(final AsyncPlayerPreLoginEvent event) {
         final String name = event.getName();
         final UUID mojangUuid = event.getUniqueId();
+        dev.shadowcore.util.Diag.info(log, "auth",
+            "onAsyncPreLogin: name=" + name + " mojangUuid=" + mojangUuid
+            + (isTransferSafe(event) ? " [transferred]" : ""));
         // Always remember what the Mojang UUID is for this real name — we
         // use this later when someone tries to /shadow that name.
         db.rememberKnownName(name, mojangUuid, true);
+        // Also record last-seen name for this UUID. Previously done in a
+        // PlayerLoginEvent handler, but Paper's HorriblePlayerLoginEventHack
+        // disables the reconfigure API whenever PlayerLoginEvent has any
+        // listeners. Doing the upsert here is equivalent for our purposes.
+        db.upsertPlayer(mojangUuid, name);
 
-        // If the incoming name matches an existing local profile, rewrite.
+        // Pending-swap rewrite. If this login is a transfer-reconnect that
+        // ShadowCore initiated as part of a profile switch, we have a
+        // record in the pending-swap registry keyed on the Mojang UUID.
+        // Rewrite the event's profile to the target identity's UUID and
+        // name so the subsequent ServerPlayer construction picks up the
+        // correct identity.
+        if (pendingSwaps != null) {
+            final Optional<dev.shadowcore.core.swap.PendingSwapRegistry.Pending> pending =
+                pendingSwaps.poll(mojangUuid);
+            if (pending.isPresent()) {
+                final dev.shadowcore.model.MountedIdentity target = pending.get().targetIdentity();
+                dev.shadowcore.util.Diag.info(log, "auth",
+                    "onAsyncPreLogin: consuming pending swap -> "
+                    + target.kind() + ":" + target.displayName() + " uuid=" + target.uuid());
+                try {
+                    final com.destroystokyo.paper.profile.PlayerProfile rewritten =
+                        org.bukkit.Bukkit.createProfile(target.uuid(), target.displayName());
+                    event.setPlayerProfile(rewritten);
+                    // Early-return: the rest of this handler's collision
+                    // check is irrelevant for a deliberate swap.
+                    return;
+                } catch (final RuntimeException ex) {
+                    dev.shadowcore.util.Diag.error(log, "auth",
+                        "onAsyncPreLogin: setPlayerProfile failed for pending swap of "
+                        + mojangUuid + "; login will continue as the Mojang identity", ex);
+                }
+            }
+        }
+
+        // If the incoming name matches an existing local profile, disallow —
+        // but ONLY if the profile doesn't belong to the logging-in person.
+        // If FirstMage (the real Mojang account) is logging in, and the
+        // profile 'FirstMage' exists in our DB, and that profile's owner
+        // is 3d263e2c... (the Mojang UUID of the person logging in), it is
+        // not a collision; it's the profile owner logging into their own
+        // main account. Only kick when someone ELSE is trying to take a
+        // name registered to another controller's profile.
         final Optional<UUID> rewritten = resolveUuidForName(name);
         if (rewritten.isPresent() && !rewritten.get().equals(mojangUuid)) {
-            // There is no public Bukkit API to change the event's UUID once
-            // Mojang has resolved it. We disallow in that case — the user
-            // is trying to log in with a name that already belongs to a
-            // local profile under some other account, and that's a name
-            // collision that must be resolved by the controller running
-            // /lprofile rename first. This is spec §9.1's "renameable
-            // collision with a newly created real account" condition.
-            event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
-                "The name '" + name + "' is currently registered as a local profile. " +
-                "The profile owner must rename it before you can log in.");
+            // Is the resolved UUID a profile owned by the logging-in person?
+            final Optional<Database.ProfileRecord> profile = db.findProfileByUuid(rewritten.get());
+            if (profile.isPresent() && profile.get().ownerUuid().equals(mojangUuid)) {
+                dev.shadowcore.util.Diag.trace(log, "auth",
+                    "onAsyncPreLogin: name '" + name + "' resolves to profile UUID="
+                    + rewritten.get() + " but profile owner is the incoming Mojang UUID — not a collision");
+            } else {
+                dev.shadowcore.util.Diag.warn(log, "auth",
+                    "onAsyncPreLogin DISALLOW: name '" + name + "' is a local profile UUID="
+                    + rewritten.get() + " (owner=" + profile.map(p -> p.ownerUuid().toString()).orElse("?")
+                    + ") but incoming Mojang UUID=" + mojangUuid + " — name collision");
+                event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
+                    "The name '" + name + "' is currently registered as a local profile. " +
+                    "The profile owner must rename it before you can log in.");
+                return;
+            }
         }
+        dev.shadowcore.util.Diag.trace(log, "auth",
+            "onAsyncPreLogin OK: no collision for " + name);
     }
 
     /**
-     * Main-thread login hook. If the plugin needs to reject a login for
-     * orchestration-level reasons (e.g., a shadow conflict still unresolved
-     * from a prior crash — spec §18), this is where we do it.
+     * Return {@code event.isTransferred()} if the API is available in this
+     * Paper version; otherwise false. Defensive because the method was
+     * added in Paper 1.20.5 and we want to compile cleanly even if the
+     * event API shifts.
      */
-    @EventHandler(priority = EventPriority.LOWEST)
-    public void onLogin(final PlayerLoginEvent event) {
-        // Currently only records last-seen name for the player's UUID.
-        db.upsertPlayer(event.getPlayer().getUniqueId(), event.getPlayer().getName());
+    private static boolean isTransferSafe(final AsyncPlayerPreLoginEvent event) {
+        try {
+            return event.isTransferred();
+        } catch (final NoSuchMethodError ignored) {
+            return false;
+        } catch (final RuntimeException ignored) {
+            return false;
+        }
     }
 }

@@ -3,12 +3,12 @@ import org.gradle.language.base.plugins.LifecycleBasePlugin
 
 plugins {
     java
-    id("io.papermc.paperweight.userdev") version "2.0.0-beta.19"
+    id("io.papermc.paperweight.userdev") version "2.0.0-beta.21"
     id("xyz.jpenilla.run-paper") version "2.3.1"
 }
 
 group = "dev.shadowcore"
-version = "3.0.0-SNAPSHOT"
+version = "4.0.0-alpha15"
 
 java {
     toolchain {
@@ -41,13 +41,15 @@ dependencies {
 paperweight.reobfArtifactConfiguration = ReobfArtifactConfiguration.MOJANG_PRODUCTION
 
 tasks.processResources {
-    val props = mapOf("version" to version)
-    inputs.properties(props)
-    filesMatching("paper-plugin.yml") {
-        expand(props)
-    }
+    val versionStr = project.version.toString()
+    inputs.property("version", versionStr)
     filesMatching("plugin.yml") {
-        expand(props)
+        // Use plain String.replace rather than Groovy's expand() — expand()
+        // has sometimes left ${version} unexpanded under the Kotlin DSL
+        // depending on caching / template engine quirks, which then shows
+        // as a literal "v${version}" in /plugins and log output. filter()
+        // with a lambda is dependable across Gradle versions.
+        filter { line -> line.replace("\${version}", versionStr) }
     }
 }
 

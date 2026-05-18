@@ -4,8 +4,17 @@ main: dev.shadowcore.ShadowCorePlugin
 api-version: '1.21'
 load: STARTUP
 author: ShadowCore
-description: Controller + mounted doll identity orchestration.
+description: Identity orchestration — local profiles, shadow mounting, multi-login. 4.0 skeleton.
 
+# ProtocolLib is a soft-dependency. The plugin functions without it: the
+# SkinCloak layer (outbound PlayerInfo rewriting for PHANTOM mode cheat-
+# client resistance) is only installed when ProtocolLib is present, and
+# PHANTOM still works without it via REMOVE broadcasts plus the vanilla
+# INVISIBILITY mob effect.
+#
+# Using Bukkit-style plugin.yml (not paper-plugin.yml) because Paper plugins
+# do not support YAML-based command declarations, and getCommand() throws
+# UnsupportedOperationException during startup under paper-plugin.yml.
 softdepend: [ProtocolLib]
 
 commands:
